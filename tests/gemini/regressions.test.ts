@@ -101,12 +101,17 @@ describe('regresiones de fallos observados', () => {
 
     describe('el progreso no puede aparentar estar colgado', () => {
         it('una espera por saturación se anuncia con su motivo', async () => {
+            // Dos 503 seguidos, no uno: el primero se lo come la sonda sin
+            // streaming, que comprueba si lo que falla es el modelo o sólo esa
+            // ruta. Con un único 503 la sonda encuentra el modelo sano y
+            // responde al momento — no hay espera, y no hay nada que anunciar.
+            // La espera de verdad empieza cuando también falla la sonda.
             let n = 0;
-            installMocks(() => (++n === 1 ? overloaded() : geminiStream(fakeTranscript(0, 600))));
+            installMocks(() => (++n <= 2 ? overloaded() : geminiStream(fakeTranscript(0, 600))));
             await transcribeWithGemini(audioFile(), 'KEY', undefined, 600);
 
             const eventos = progress.getSnapshot().events;
             expect(eventos.some(e => e.kind === 'retry' && /Overloaded|saturado|Límite/i.test(e.text))).toBe(true);
-        });
+        }, 20_000);
     });
 });

@@ -214,7 +214,14 @@ describe('cuarentena compartida durante una caída', () => {
 
         expect(buenas).toBe(7);
         // Siete fragmentos × 3 intentos = 21 peticiones inútiles sin cuarentena.
-        expect(muertas).toBeLessThanOrEqual(MAX_RETRIES_PER_MODEL * 2);
+        //
+        // El suelo real son seis: los seis que arrancan a la vez descubren la
+        // caída cada uno con su petición, porque salen antes de que ninguno
+        // haya vuelto. El séptimo ya encuentra el modelo apartado y no gasta
+        // nada. Encima va UNA sonda sin streaming, para saber si lo que está
+        // caído es el modelo o sólo esa ruta: la paga el primero que aparta el
+        // modelo, y sólo él.
+        expect(muertas).toBeLessThanOrEqual(6 + 1);
     });
 
     it('con toda la cadena caída no se dispara el número de peticiones', async () => {

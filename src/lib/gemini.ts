@@ -779,18 +779,6 @@ async function geminiGenerateWithFallback(
                     throw definitive(new Error(apiMessage));
                 }
 
-                // ¿Es el modelo el que está saturado, o sólo la ruta de
-                // streaming? Se comprueba en vez de suponerlo: una sola
-                // petición equivalente sin streaming lo dice. Si esa sí
-                // responde, el resto de la ejecución va por ahí.
-                if (overloaded && !streamingDisabled) {
-                    const probe = await tryWithoutStreaming(model, apiKey, buildBody, label, onDelta);
-                    if (probe) {
-                        markModelHealthy(model);
-                        return { ...probe, modelUsed: model, modelIndex: mi };
-                    }
-                }
-
                 if (overloaded) {
                     sawOverload = true;
                     // Basta un 503 para apartarlo: los demás fragmentos no
@@ -801,7 +789,27 @@ async function geminiGenerateWithFallback(
                     // nosotros, así que lo que toca es esperar el `retryDelay`
                     // que manda la propia API y volver — apartarlo tiraba a la
                     // basura el reintento que sí habría funcionado.
+                    const alreadyCooling = modelCooldownMs(model) > 0;
                     coolDownModel(model);
+
+                    // ¿Es el modelo el que está saturado, o sólo la ruta de
+                    // streaming? Se comprueba en vez de suponerlo: una sola
+                    // petición equivalente sin streaming lo dice. Si esa sí
+                    // responde, el resto de la ejecución va por ahí.
+                    //
+                    // La sonda va DESPUÉS de apartar el modelo, y sólo la paga
+                    // quien lo aparta. Antes iba delante y sin condición: con
+                    // seis fragmentos en paralelo contra un modelo caído, los
+                    // seis se comían su 503 y los seis sondeaban — el número de
+                    // peticiones contra un servicio ya caído se duplicaba, que
+                    // es justo la tormenta que la cuarentena existe para evitar.
+                    if (!alreadyCooling && !streamingDisabled) {
+                        const probe = await tryWithoutStreaming(model, apiKey, buildBody, label, onDelta);
+                        if (probe) {
+                            markModelHealthy(model);
+                            return { ...probe, modelUsed: model, modelIndex: mi };
+                        }
+                    }
                 }
 
                 // --- Agotados los reintentos de este modelo → siguiente de la cadena ---

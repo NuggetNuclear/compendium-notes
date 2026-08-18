@@ -179,7 +179,11 @@ function ChunkGrid({ chunks, locale, selected, onSelect }: {
                                         ? (es ? 'en cola' : 'queued')
                                         : c.status === 'done'
                                             ? (es ? 'listo' : 'done')
-                                            : (es ? 'procesando' : 'processing')}
+                                            // El fragmento en curso lleva su avance: sale de los
+                                            // timestamps que va emitiendo el modelo, así que es el
+                                            // minuto de grabación por el que va de verdad. Sin él,
+                                            // seis fragmentos "procesando" son seis cajas iguales.
+                                            : `${es ? 'procesando' : 'processing'}${c.progress > 0 ? ` · ${Math.round(c.progress * 100)}%` : ''}`}
                             </span>
                         </button>
                     );
@@ -391,6 +395,24 @@ function waitingForModel(chunks: ChunkState[]): boolean {
 }
 
 /**
+ * Lo que falta, en palabras.
+ *
+ * La ETA ya se calculaba (`snap.etaMs`) pero esta pantalla no la enseñaba, así
+ * que lo único a la vista era un cronómetro subiendo — que dice cuánto llevas,
+ * no cuánto queda. Aquí va redondeada y en palabras a propósito: un "quedan
+ * ~137 s" es una precisión que la estimación no tiene, y cuando falla se nota.
+ */
+function friendlyEta(ms: number | null, locale: 'es' | 'en'): string {
+    const es = locale === 'es';
+    if (ms === null) return es ? 'Calculando lo que falta' : 'Estimating time left';
+    if (ms < 20_000) return es ? 'Ya casi está' : 'Almost there';
+    if (ms < 60_000) return es ? 'Menos de un minuto' : 'Less than a minute';
+    const min = Math.round(ms / 60_000);
+    if (min <= 1) return es ? 'Un minuto aproximadamente' : 'About a minute';
+    return es ? `Unos ${min} minutos` : `About ${min} minutes`;
+}
+
+/**
  * Cuánta grabación lleva escuchada. Es el dato más concreto que se puede dar
  * sin hablar de fragmentos, modelos ni peticiones: minutos de SU clase.
  */
@@ -581,6 +603,9 @@ export default function ProcessingView() {
                 {escuchado && (
                     <p className="text-xs tabular-nums mt-1" style={{ color: 'var(--text-muted)' }}>{escuchado}</p>
                 )}
+                <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }} aria-live="polite">
+                    {friendlyEta(snap.etaMs, locale)}
+                </p>
             </div>
 
             {/* Espera deliberada y silencio: explicados, no disimulados */}

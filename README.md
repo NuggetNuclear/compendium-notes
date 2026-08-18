@@ -44,7 +44,7 @@ The web application runs entirely in your browser using **client-side processing
 - **Frontend**: Astro (Static Shell) + React (Interactive App)
 - **Styling**: Vanilla CSS + Tailwind + Framer Motion
 - **State Management**: Zustand + Dexie.js (IndexedDB for persistent sessions)
-- **Audio Processing**: Web Audio API + `@ffmpeg/ffmpeg` (WebAssembly)
+- **Audio Processing**: `@ffmpeg/ffmpeg` (WebAssembly)
 - **AI Integration**: Direct REST API calls to Groq & Google AI Studio
 
 ---
@@ -59,10 +59,10 @@ Real-world processing performance for a 1-hour lecture (~50MB audio):
 | **Gemini** | 3.5/3.1 Flash Lite (transcribe) + 3.7 Flash (notes) | ~30-45 seconds | **Free** | Long seminars, extreme accuracy |
 
 **The Pipeline Flow:**
-1. **Audio Compression**: Large files are automatically compressed locally using Web Audio API down to 16kHz mono (reducing 100MB files to ~10MB).
-2. **Intelligent Chunking**: Anything longer than 10 minutes is split into **10-minute chunks** (FFmpeg WebAssembly for container formats, byte splicing for MP3/WAV). Short chunks keep each model call inside the range where it stays accurate, and a failure costs ten minutes of audio instead of an hour.
-3. **Parallel Transcription**: Chunks go straight from your browser to **Flash Lite only** (15 RPM · 500 RPD), several at a time — you choose how many, and the app never exceeds what the free tier allows. Responses are **streamed**, so each chunk's progress bar moves with the timestamps the model emits.
-4. **Markdown Organization**: The full transcript goes back in **one large request** to a **Flash** model, which writes the title and the structured notes. Flash models only allow **20 requests a day** each, so when all four are spent the app falls back to Flash Lite rather than throwing away a transcript it already paid for. There is **no Pro fallback**: every Pro model reports a `0/0` free-tier quota.
+1. **Audio Compression**: Large files are automatically compressed locally using FFmpeg WebAssembly down to 16kHz mono (reducing 100MB files to ~10MB).
+2. **Intelligent Chunking**: Anything longer than 10 minutes is split into **10-minute chunks** (FFmpeg WebAssembly). Short chunks keep each model call inside the range where it stays accurate, and a failure costs ten minutes of audio instead of an hour.
+3. **Parallel Transcription**: Chunks go straight from your browser to the chosen API, several at a time — you choose how many, and the app never exceeds what the free tier allows. Responses are **streamed**, so each chunk's progress bar moves with the timestamps the model emits.
+4. **Markdown Organization**: The full transcript goes back in **one large request** to a text model, which writes the title and the structured notes.
 5. **Interactive Editor**: Review the transcript, edit the markdown, and export to PDF.
 
 ---
@@ -76,8 +76,7 @@ graph TD
         Upload["Audio/Video File"]
         Store["LocalStorage (Keys)"]
         App["Compendium Notes App"]
-        AudioAPI["Web Audio API (Compression)"]
-        FFmpeg["FFmpeg WebAssembly (Chunking)"]
+        FFmpeg["FFmpeg WebAssembly (Compression & Chunking)"]
     end
     
     subgraph "External AI APIs"
@@ -89,10 +88,8 @@ graph TD
     Upload --> App
     Store --> App
     
-    App --> AudioAPI
-    AudioAPI -- "If > 10 mins & Gemini" --> FFmpeg
-    AudioAPI -- "Otherwise" --> APIs
-    FFmpeg -- "10-min chunks, N in parallel" --> Gemini
+    App --> FFmpeg
+    FFmpeg -- "Compressed & Chunked" --> APIs
     
     APIs{"API Router"}
     APIs -- "Direct HTTPS" --> Groq

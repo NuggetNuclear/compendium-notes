@@ -6,6 +6,7 @@ import { progress, m } from './progress';
 import { stripRepetitionRuns, lastTimestampSeconds, secondsToLabel, tailRepetitionRun } from './text-cleanup';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
 import { sanitizeDuration } from './duration';
+import { forEachSSE } from './sse';
 
 // ---------------------------------------------------------------------------
 // Modelos, límites de free tier y cadenas
@@ -340,35 +341,6 @@ const backoffMs = (attempt: number) => Math.min(Math.pow(2, attempt + 1) * 1000 
 const TIMEOUT_GENERATE_MS = 600_000;   // 10 min: transcripción u organización
 const TIMEOUT_UPLOAD_START_MS = 60_000;
 const TIMEOUT_UPLOAD_STATUS_MS = 30_000;
-/** Silencio máximo tolerado DENTRO de un stream ya abierto. */
-const STREAM_STALL_MS = 90_000;
-
-/**
- * `reader.read()` con plazo: la promesa de un stream que se queda mudo no se
- * rechaza sola, y sin esto una respuesta cortada a medias dejaba la lectura
- * esperando para siempre.
- */
-async function readWithDeadline<T>(
-    reader: ReadableStreamDefaultReader<T>,
-    ms: number,
-    label: string,
-): Promise<{ done: boolean; value?: T }> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-        return await Promise.race([
-            reader.read(),
-            new Promise<never>((_, reject) => {
-                timer = setTimeout(
-                    () => reject(new Error(`${label} dejó de enviar datos durante ${Math.round(ms / 1000)}s`)),
-                    ms,
-                );
-            }),
-        ]);
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 function parseRetryDelayMs(err: any): number | null {
     const details = err?.error?.details;
     if (!Array.isArray(details)) return null;
@@ -423,25 +395,12 @@ async function readGeminiStream(
     /** Devolver `false` corta la lectura: el resto de la respuesta no sirve. */
     onDelta?: (accumulated: string) => boolean | void,
 ): Promise<{ text: string; finishReason: string | null; tokensUsed: number }> {
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error(`${label} devolvió una respuesta sin cuerpo`);
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let raw = '';
     let text = '';
     let finishReason: string | null = null;
     let tokensUsed = 0;
-    let sawSSE = false;
-    let stop = false;
 
-    const absorb = (payload: string) => {
-        let parsed: any;
-        try {
-            parsed = JSON.parse(payload);
-        } catch {
-            return false;   // trozo incompleto: se recompone en la vuelta siguiente
-        }
+    /** Vuelca un objeto de respuesta en el acumulado. */
+    const absorb = (parsed: any) => {
         const candidate = parsed?.candidates?.[0];
         const parts = candidate?.content?.parts;
         if (Array.isArray(parts)) {
@@ -452,46 +411,27 @@ async function readGeminiStream(
         if (candidate?.finishReason) finishReason = candidate.finishReason;
         const count = parsed?.usageMetadata?.candidatesTokenCount;
         if (typeof count === 'number' && count > tokensUsed) tokensUsed = count;
-        return true;
     };
 
-    while (!stop) {
-        throwIfCancelled();
-        const { done, value } = await readWithDeadline(reader, STREAM_STALL_MS, label);
-        if (done) break;
-        const piece = decoder.decode(value, { stream: true });
-        raw += piece;
-        buffer += piece;
+    const { raw, sawSSE, trailing } = await forEachSSE(response, label, (parsed) => {
+        absorb(parsed);
+        return onDelta?.(text);
+    });
 
-        let nl: number;
-        while ((nl = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, nl).trim();
-            buffer = buffer.slice(nl + 1);
-            if (!line.startsWith('data:')) continue;
-            sawSSE = true;
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            if (absorb(payload) && onDelta?.(text) === false) { stop = true; break; }
-        }
-    }
-
-    if (stop) await reader.cancel().catch(() => { /* ya cerrado */ });
-
-    const rest = buffer.trim();
     if (sawSSE) {
-        if (rest.startsWith('data:')) {
-            const payload = rest.slice(5).trim();
-            if (payload && payload !== '[DONE]' && absorb(payload)) onDelta?.(text);
+        // Una última línea `data:` sin salto de línea final.
+        if (trailing.startsWith('data:')) {
+            const payload = trailing.slice(5).trim();
+            if (payload && payload !== '[DONE]') {
+                try { absorb(JSON.parse(payload)); onDelta?.(text); } catch { /* incompleta */ }
+            }
         }
     } else if (raw.trim()) {
         // No era SSE: un único JSON (o un array de ellos, que es lo que
         // devuelve streamGenerateContent sin `alt=sse`).
-        const body = raw.trim();
         try {
-            const parsed = JSON.parse(body);
-            for (const piece of Array.isArray(parsed) ? parsed : [parsed]) {
-                absorb(JSON.stringify(piece));
-            }
+            const parsed = JSON.parse(raw.trim());
+            for (const piece of Array.isArray(parsed) ? parsed : [parsed]) absorb(piece);
             onDelta?.(text);
         } catch {
             throw new Error(`${label} devolvió una respuesta ilegible`);
@@ -569,10 +509,6 @@ function markModelHealthy(model: string): void {
  * progreso más fina.
  */
 let streamingDisabled = false;
-
-export function isStreamingDisabled(): boolean {
-    return streamingDisabled;
-}
 
 /** Empieza de cero. La llama cada ejecución nueva y las pruebas. */
 export function resetModelHealth(): void {

@@ -1,5 +1,6 @@
 const GROQ_API_URL = 'https://api.groq.com/openai/v1';
 import { progress, m as msg } from './progress';
+import { forEachSSE } from './sse';
 import { stripRepetitionRuns, tailRepetitionRun, secondsToLabel } from './text-cleanup';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
 
@@ -215,34 +216,6 @@ const MAX_CHUNK_ATTEMPTS = 2;
 const MAX_LLAMA_RETRIES = 2;
 /** Plazo para que Groq empiece a responder la organización. */
 const TIMEOUT_ORGANIZE_MS = 300_000;
-/** Silencio máximo tolerado dentro de un stream ya abierto. */
-const STREAM_STALL_MS = 90_000;
-
-/**
- * `reader.read()` con plazo: la promesa de un stream que se queda mudo no se
- * rechaza sola.
- */
-async function readWithDeadline<T>(
-    reader: ReadableStreamDefaultReader<T>,
-    ms: number,
-    label: string,
-): Promise<{ done: boolean; value?: T }> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-        return await Promise.race([
-            reader.read(),
-            new Promise<never>((_, reject) => {
-                timer = setTimeout(
-                    () => reject(new Error(`${label} dejó de enviar datos durante ${Math.round(ms / 1000)}s`)),
-                    ms,
-                );
-            }),
-        ]);
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 /**
  * Transcribe los fragmentos en serie, tolerando el fallo de cualquiera.
  *
@@ -666,16 +639,10 @@ async function callTextModel(
         throw new Error(apiMessage);
     }
 
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('Respuesta de Groq sin cuerpo legible');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
     let content = '';
-    let looped = false;
-
     let loopCheckAt = 3000;
-    const publish = () => {
+
+    const publish = (): boolean | void => {
         progress.setStreamCounters(content.length);
         if (content.length >= loopCheckAt) {
             loopCheckAt = content.length + 3000;
@@ -685,7 +652,7 @@ async function callTextModel(
                     'El modelo se atascó repitiendo — se corta ahí',
                     'The model got stuck repeating — cutting it short',
                 ));
-                looped = true;
+                return false;   // corta el stream: la respuesta ya no aporta
             }
         }
         const headings = content.match(/^##\s+.*$/gm) || [];
@@ -699,36 +666,12 @@ async function callTextModel(
             : msg('Analizando la transcripción', 'Analyzing the transcript'));
     };
 
-    // Un stream abierto que deja de mandar texto es indistinguible de uno que
-    // trabaja, salvo por el tiempo: `readWithDeadline` pone ese límite. Sin él,
-    // un corte a mitad de respuesta dejaba la lectura esperando para siempre.
-    while (!looped) {
-        throwIfCancelled();
-        const { done, value } = await readWithDeadline(reader, STREAM_STALL_MS, `Groq (${model})`);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let nl: number;
-        while ((nl = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, nl).trim();
-            buffer = buffer.slice(nl + 1);
-            if (!line.startsWith('data:')) continue;
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-                const parsed = JSON.parse(payload);
-                const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                    content += delta;
-                    publish();
-                }
-            } catch {
-                /* trozo incompleto: se recompone en la siguiente vuelta */
-            }
-        }
-    }
-
-    if (looped) await reader.cancel().catch(() => {});
+    await forEachSSE(response, `Groq (${model})`, (parsed) => {
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (!delta) return;
+        content += delta;
+        return publish();
+    });
 
     const { text: cleaned } = stripRepetitionRuns(content);
     return cleaned || null;

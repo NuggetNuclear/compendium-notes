@@ -360,12 +360,6 @@ export function t(key: TranslationKey, locale: Locale): string {
     return translations[key]?.[locale] ?? key;
 }
 
-export function getLocaleFromBrowser(): Locale {
-    if (typeof window === 'undefined') return 'es';
-    const stored = localStorage.getItem('scn-lang');
-    if (stored === 'en' || stored === 'es') return stored;
-    return navigator.language.startsWith('en') ? 'en' : 'es';
-}
 
 export function setLocale(locale: Locale): void {
     if (typeof window !== 'undefined') {

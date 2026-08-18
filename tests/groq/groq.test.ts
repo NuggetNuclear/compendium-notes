@@ -231,8 +231,10 @@ describe('Groq · modelos vigentes', () => {
         const ctx = installMocks(() => groqStream('## Título\nX'));
         await organizeNotes('transcripción de prueba', 'KEY', undefined, 'short', 'auto');
         const body = ctx.calls[0].body;
-        const entrada = (body.messages[0].content.length + body.messages[1].content.length) / 4;
-        expect(entrada + body.max_tokens).toBeLessThan(8000);
+        // Sumando todos los mensajes: el prompt va entero en uno solo desde que
+        // lo construye `notes-prompt`, pero lo que importa aquí es el total.
+        const chars = body.messages.reduce((n: number, msg: any) => n + msg.content.length, 0);
+        expect(chars / 4 + body.max_tokens).toBeLessThan(8000);
     });
 });
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { sanitizeDuration } from '../../src/lib/duration';
-import { resolveTranscriptionModel } from '../../src/lib/models';
+import { resolveTranscriptionModel } from '../../src/lib/providers';
 import { beginRun, abortRun, sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from '../../src/lib/pipeline-control';
 import { progress } from '../../src/lib/progress';
 import { transcribeWithGeminiChunked } from '../../src/lib/gemini';

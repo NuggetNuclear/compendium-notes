@@ -5,8 +5,8 @@ import { useAppStore } from '../../lib/store';
 import type { SummaryLevel } from '../../lib/store';
 import { t } from '../../lib/i18n';
 import { generatePdf } from '../../lib/pdf-generator';
-import { organizeNotes } from '../../lib/groq';
-import { organizeNotesWithGemini } from '../../lib/gemini';
+import { providerFor } from '../../lib/providers';
+import { splitTitle } from '../../lib/notes-prompt';
 import SearchableLanguageSelect from './SearchableLanguageSelect';
 
 export default function NotesEditor() {
@@ -539,25 +539,16 @@ export default function NotesEditor() {
                                                         const key = activeKey();
                                                         if (!key) throw new Error('API Key missing');
 
-                                                        if (provider === 'gemini') {
-                                                            const result = await organizeNotesWithGemini(transcription, key, undefined, level, outputLanguage);
-                                                            const titleMatch = result.notes.match(/^#\s+(.+)/m);
-                                                            let cleanNotes = result.notes;
-                                                            if (titleMatch) {
-                                                                setTitle(titleMatch[1].trim());
-                                                                cleanNotes = result.notes.replace(/^#\s+.+\n+/, '').trim();
-                                                            }
-                                                            setOrganizedNotes(cleanNotes);
-                                                        } else {
-                                                            const notes = await organizeNotes(transcription, key, undefined, level, outputLanguage);
-                                                            const titleMatch = notes.match(/^## Título\s*\n(.+)/m);
-                                                            let cleanNotes = notes;
-                                                            if (titleMatch) {
-                                                                setTitle(titleMatch[1].trim().replace(/\*\*/g, ''));
-                                                                cleanNotes = notes.replace(/^## Título\s*\n.+\n*/m, '').trim();
-                                                            }
-                                                            setOrganizedNotes(cleanNotes);
-                                                        }
+                                                        const { notes } = await providerFor(provider).organize({
+                                                            transcription,
+                                                            apiKey: key,
+                                                            summaryLevel: level,
+                                                            outputLanguage,
+                                                            onStep: () => { /* el botón ya muestra que trabaja */ },
+                                                        });
+                                                        const { title: newTitle, body } = splitTitle(notes);
+                                                        if (newTitle) setTitle(newTitle);
+                                                        setOrganizedNotes(body);
                                                         setSummaryLevel(level);
                                                     } catch (err: any) {
                                                         console.error('Re-summarize error:', err);

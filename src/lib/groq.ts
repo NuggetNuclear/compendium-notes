@@ -1,5 +1,4 @@
 const GROQ_API_URL = 'https://api.groq.com/openai/v1';
-import { getLanguageNameEn } from './languages';
 import { progress, m as msg } from './progress';
 import { stripRepetitionRuns, tailRepetitionRun, secondsToLabel } from './text-cleanup';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
@@ -437,6 +436,7 @@ const MAX_OUTPUT_TOKENS = 3000;
 const MAX_CHARS_PER_CHUNK = (GROQ_TPM * TPM_SAFETY - MAX_OUTPUT_TOKENS) * 4;
 
 import type { SummaryLevel } from './store';
+import { buildNotesPrompt, type NotesPart } from './notes-prompt';
 
 export async function organizeNotes(
     transcription: string,
@@ -455,7 +455,7 @@ export async function organizeNotes(
 
     if (chunks.length === 1) {
         // Single chunk — full format
-        const result = await callTextModel(chunks[0], apiKey, 'full', undefined, summaryLevel, outputLanguage, [0, 1]);
+        const result = await callTextModel(chunks[0], apiKey, undefined, summaryLevel, outputLanguage, [0, 1]);
         onStep?.(4);
         if (!result) throw new Error('La IA no generó contenido. Intenta de nuevo.');
         onStep?.(5);
@@ -472,7 +472,6 @@ export async function organizeNotes(
     let fallos = 0;
 
     for (let i = 0; i < chunks.length; i++) {
-        const isFirst = i === 0;
         const partLabel = `Parte ${i + 1}/${chunks.length}`;
 
         // Una parte que falla no puede tirar las que ya están redactadas: se
@@ -482,8 +481,7 @@ export async function organizeNotes(
             const result = await callTextModel(
                 chunks[i],
                 apiKey,
-                isFirst ? 'first' : 'continuation',
-                partLabel,
+                { index: i, total: chunks.length },
                 summaryLevel,
                 outputLanguage,
                 [i / chunks.length, (i + 1) / chunks.length],
@@ -555,8 +553,7 @@ function splitTranscription(text: string, maxChars: number): string[] {
 async function callTextModel(
     transcriptionChunk: string,
     apiKey: string,
-    mode: 'full' | 'first' | 'continuation',
-    partLabel?: string,
+    part: NotesPart | undefined,
     summaryLevel: SummaryLevel = 'short',
     outputLanguage: string = 'auto',
     /** Tramo [desde, hasta] de la etapa 'organize' que cubre esta llamada. */
@@ -576,184 +573,26 @@ async function callTextModel(
             `${model} no disponible — probando ${GROQ_MODEL_CHAIN[modelIndex + 1]}`,
             `${model} unavailable — trying ${GROQ_MODEL_CHAIN[modelIndex + 1]}`,
         ));
-        return callTextModel(transcriptionChunk, apiKey, mode, partLabel, summaryLevel, outputLanguage,
+        return callTextModel(transcriptionChunk, apiKey, part, summaryLevel, outputLanguage,
             stageRange, { modelIndex: modelIndex + 1, attempt: 0 });
     };
-    const langInstructions = outputLanguage === 'auto'
-        ? 'Write ALL notes strictly in the EXACT SAME LANGUAGE as the original audio. Do NOT translate anything.'
-        : `TRANSLATE the Title, Summary, Key Concepts, and Definitions strictly into ${getLanguageNameEn(outputLanguage)}.`;
-
-    const translationRule = outputLanguage === 'auto'
-        ? '- Keep everything in the original spoken language of the audio.'
-        : `- CRITICAL: Translate ONLY the Title, Summary, Concepts, and Definitions into ${getLanguageNameEn(outputLanguage).toUpperCase()}. The content blocks under ### [MM:SS] MUST REMAIN IN THE ORIGINAL SPOKEN LANGUAGE and must NOT be translated.`;
-
-    // SHORT prompt
-    const shortPrompt = `You are an expert assistant specialized in creating structured academic notes. Your task is to organize an audio transcript into clear and professional notes ${langInstructions}
-
-OUTPUT FORMAT (Markdown):
-
-## Title
-[Brief and descriptive title of the main topic]
-
-## Summary
-- [Point 1: max 2 lines]
-- [Point 2: max 2 lines]
-- [Point 3: max 2 lines]
-(3-5 bullets)
-
-## Key Concepts
-**Term 1**: Brief explanation
-**Term 2**: Brief explanation
-
-## Definitions
-> **[Concept]**: [Textual definition from the audio]
-
-## Content
-
-### [00:00] Introduction
-[Translated and organized main points of this section]
-
-### [MM:SS] [Section Title]
-[Translated and organized main points of this section]
-
-IMPORTANT INSTRUCTIONS:
-- Maintain an academic but clear language
-- Highlight technical terms with **bold**
-- Timestamps must be in [MM:SS] format
-- Divide into logical sections approximately every 3-5 minutes
-- Correct grammatical errors from the transcription
-- Remove filler words and unnecessary repetitions
-- If there are no clear definitions in the audio, omit the Definitions section
-${translationRule}`;
-
-    // MEDIUM prompt
-    const mediumPrompt = `You are an expert assistant specialized in creating structured and detailed academic notes. Your task is to organize an audio transcript into professional notes ${langInstructions}
-
-OUTPUT FORMAT (Markdown):
-
-# [Descriptive Title of the Topic]
-
-## Summary
-[3-5 paragraphs synthesizing the complete content. Each paragraph 3-4 lines.]
-
-## Key Concepts
-- **Concept 1**: 2-3 line explanation
-- **Concept 2**: 2-3 line explanation
-(8-12 concepts)
-
-## Definitions
-> **[Term]**: [Complete definition based on the audio]
-
-## Content Development
-
-### [MM:SS] [Section Title]
-[2-4 paragraphs of translated and organized content developing this section]
-
-### [MM:SS] [Next section]
-[2-4 paragraphs with examples and details]
-
-## Review Questions
-1. **Q:** [Conceptual question]
-   **A:** [2-3 line answer]
-(5-10 questions)
-
-INSTRUCTIONS:
-- Academic but clear language
-- Highlight technical terms with **bold**
-- Timestamps in [MM:SS] format
-- Correct grammatical errors
-- Remove filler words
-- Develop each section with sufficient detail
-${translationRule}`;
-
-    // LONG prompt
-    const longPrompt = `You are an expert assistant specialized in creating EXHAUSTIVE and professional academic notes ${langInstructions}
-
-CRITICAL OBJECTIVE:
-Transform the transcript into an academic document SO COMPLETE that it eliminates the need to listen to the audio again.
-
-EXHAUSTIVENESS RULE:
-- DO NOT mention the word exhaustive or any similar word in the content.
-- USE ALL AVAILABLE TOKENS
-- DO NOT summarize too much - DEVELOP each concept COMPLETELY
-- If the transcript is long, the notes MUST be proportionally long
-- Each section must have MULTIPLE dense paragraphs
-
-STRUCTURE:
-
-# [Professional Descriptive Title]
-
-## 1. Summary
-[3-6 DENSE paragraphs. Each paragraph 4-6 lines minimum.]
-
-## 2. Key Concepts
-- **Concept**: Detailed explanation
-(8-15 concepts)
-
-## 3. Content Development
-### [MM:SS] [Subtitle]
-[4-8 paragraphs of translated and organized content per section: context, theoretical explanation, examples, implications]
-
-## 4. Definitions and Terminology
-> **Term**: Complete definition
-
-## 5. Examples and Case Studies
-[All mentioned examples, fully developed]
-
-## 6. Connections and Synthesis
-[3-5 paragraphs connecting concepts]
-
-## 7. Review Questions
-1. **Q:** [Deep question]
-   **A:** [3-5 line answer]
-(10-20 questions)
-
-INSTRUCTIONS:
-- NO emojis
-- Clean and professional Markdown
-- Highlight terms with **bold**
-- Timestamps [MM:SS]
-- Correct grammatical errors
-- Remove filler words
-- GENERATE AS MUCH CONTENT AS POSSIBLE
-${translationRule}`;
-
-    const continuationPrompt = `You are an expert assistant specialized in creating academic notes. This is a CONTINUATION of a long transcript. Organize ONLY this part into content sections (do not repeat Synthesis or Key Concepts) ${langInstructions}
-
-OUTPUT FORMAT (Markdown):
-### [MM:SS] [Section Title]
-[Organized content]
-
-INSTRUCTIONS:
-- Maintain an academic but clear language
-- Highlight technical terms with **bold**
-- Use timestamps [MM:SS]
-- Correct grammatical errors
-- Remove filler words
-${translationRule}`;
-
-    let systemPrompt: string;
-    if (mode === 'continuation') {
-        systemPrompt = continuationPrompt;
-    } else {
-        switch (summaryLevel) {
-            case 'medium': systemPrompt = mediumPrompt; break;
-            case 'long': systemPrompt = longPrompt; break;
-            default: systemPrompt = shortPrompt; break;
-        }
-    }
-
-    const userContent = partLabel
-        ? `${partLabel} — TRANSCRIBED AUDIO:\n\n${transcriptionChunk}\n\nOrganize this part of the transcription.`
-        : `TRANSCRIBED AUDIO:\n\n${transcriptionChunk}\n\nOrganize this transcription into structured notes following the indicated format.`;
+    // El prompt es el compartido: lo que cambia entre proveedores es la red,
+    // no lo que se le pide al modelo. Aquí vivían cuatro textos propios —uno
+    // por nivel más el de continuación— que eran la versión sin refactorizar de
+    // este mismo prompt, y que nunca recibieron los arreglos que sí tuvo el
+    // otro lado.
+    //
+    // Va entero como mensaje de usuario, con la transcripción dentro, igual que
+    // en Gemini: el prompt ya lleva su propio sitio para el texto.
+    const prompt = buildNotesPrompt(transcriptionChunk, summaryLevel, outputLanguage, part);
 
     // El formato de salida lo dicta el propio prompt: sus encabezados ## son
     // el índice del documento y sirven para medir cuánto lleva escrito.
-    const expectedSections = Math.max(1, (systemPrompt.match(/^##\s/gm) || []).length);
+    const expectedSections = Math.max(1, (prompt.match(/^##\s/gm) || []).length);
     const [rangeFrom, rangeTo] = stageRange;
 
     // Reservar hueco en la ventana de TPM antes de gastar la petición.
-    const estimatedTokens = Math.ceil((systemPrompt.length + userContent.length) / 4) + MAX_OUTPUT_TOKENS;
+    const estimatedTokens = Math.ceil(prompt.length / 4) + MAX_OUTPUT_TOKENS;
     await reserveTpm(estimatedTokens);
 
     const response = await fetchWithTimeout(`${GROQ_API_URL}/chat/completions`, {
@@ -764,10 +603,7 @@ ${translationRule}`;
         },
         body: JSON.stringify({
             model,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userContent },
-            ],
+            messages: [{ role: 'user', content: prompt }],
             temperature: 0.3,
             max_tokens: MAX_OUTPUT_TOKENS,
             // Misma petición y mismos tokens que sin streaming: sólo cambia que
@@ -812,7 +648,7 @@ ${translationRule}`;
             progress.beginWait(Date.now() + waitMs, msg('Límite de peticiones de Groq', 'Groq rate limit'));
             await sleep(waitMs);
             progress.endWait();
-            return callTextModel(transcriptionChunk, apiKey, mode, partLabel, summaryLevel, outputLanguage,
+            return callTextModel(transcriptionChunk, apiKey, part, summaryLevel, outputLanguage,
                 stageRange, { modelIndex, attempt: attempt + 1 });
         }
 
@@ -823,7 +659,7 @@ ${translationRule}`;
                 throw new Error(apiMessage);
             }
             await sleep(5000);
-            return callTextModel(transcriptionChunk, apiKey, mode, partLabel, summaryLevel, outputLanguage,
+            return callTextModel(transcriptionChunk, apiKey, part, summaryLevel, outputLanguage,
                 stageRange, { modelIndex, attempt: attempt + 1 });
         }
 

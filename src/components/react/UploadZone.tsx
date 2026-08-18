@@ -1,6 +1,6 @@
 import React, { useCallback, useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../../lib/store';
-import { resolveTranscriptionModel, transcriptionModelsFor } from '../../lib/models';
+import { resolveTranscriptionModel, transcriptionModelsFor } from '../../lib/providers';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileAudio, FileVideo, Mic, Loader2, AlertCircle, CheckCircle, Clock, Volume2, ArrowRight, Sparkles, Zap, BrainCircuit, Info, RefreshCw, ChevronDown } from 'lucide-react';
 import { t } from '../../lib/i18n';

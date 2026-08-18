@@ -2,17 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { X, Eye, EyeOff, Clipboard, ExternalLink, Check, BadgeCheck, Loader2, Trash2, ChevronDown } from 'lucide-react';
 import { useAppStore } from '../../lib/store';
-import { resolveTranscriptionModel, transcriptionModelsFor } from '../../lib/models';
+import { resolveTranscriptionModel, transcriptionModelsFor, providerFor } from '../../lib/providers';
 import { t } from '../../lib/i18n';
-import { validateGroqKey } from '../../lib/groq';
-import { validateGeminiKey } from '../../lib/gemini';
 import SearchableLanguageSelect from './SearchableLanguageSelect';
-
-/**
- * Simultaneidad ofrecida. 0 es "automático", que es lo que debería elegir casi
- * todo el mundo; el resto está para quien sabe lo que hace. Por encima de 6 la
- * propia capa de red recorta, así que ofrecer 10 sería mentir.
- */
 
 export default function ConfigModal() {
     const {
@@ -45,7 +37,7 @@ export default function ConfigModal() {
 
         try {
             if (groqInput) {
-                const isValid = await validateGroqKey(groqInput.trim());
+                const isValid = await providerFor('groq').validateKey(groqInput.trim());
                 if (!isValid) {
                     setErrorMsg(t('app.config.error.groq', locale));
                     setValidating(false);
@@ -56,7 +48,7 @@ export default function ConfigModal() {
             }
 
             if (geminiInput) {
-                const isValid = await validateGeminiKey(geminiInput.trim());
+                const isValid = await providerFor('gemini').validateKey(geminiInput.trim());
                 if (!isValid) {
                     setErrorMsg(t('app.config.error.gemini', locale));
                     setValidating(false);

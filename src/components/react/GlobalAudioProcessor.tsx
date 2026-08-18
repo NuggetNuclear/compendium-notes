@@ -1,13 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { useAppStore } from '../../lib/store';
 import { processAudioForUpload } from '../../lib/audio-processor';
-import { transcribeAudio, organizeNotes } from '../../lib/groq';
 import { t } from '../../lib/i18n';
-import { transcribeWithGemini, organizeNotesWithGemini, transcribeWithGeminiChunked, DURATION_THRESHOLD_CHUNKING, resetModelHealth } from '../../lib/gemini';
+import { resetModelHealth } from '../../lib/gemini';
+import { splitTitle } from '../../lib/notes-prompt';
+import { providerFor, resolveTranscriptionModel } from '../../lib/providers';
 import { updateProjectState, db } from '../../lib/db';
 import { progress, m as msg } from '../../lib/progress';
 import { beginRun, isAborted, isCancelledError } from '../../lib/pipeline-control';
-import { resolveTranscriptionModel } from '../../lib/models';
 
 /**
  * Escritura de estado en IndexedDB que no puede tumbar el proceso.
@@ -130,11 +130,7 @@ export default function GlobalAudioProcessor() {
             }
 
             try {
-                if (provider === 'gemini') {
-                    await runGeminiFlow(key, isCancelled);
-                } else {
-                    await runGroqFlow(key, isCancelled);
-                }
+                await runFlow(key, isCancelled);
             } catch (err: any) {
                 if (isCancelled() || isCancelledError(err)) {
                     console.log('[Processor] Process cancelled by user');
@@ -161,468 +157,177 @@ export default function GlobalAudioProcessor() {
         run();
     }, [file, processingState, apiKey, geminiKey, provider]);
 
-    const runGeminiFlow = async (key: string, isCancelled: () => boolean) => {
-        const flowStartTime = Date.now();
+    /**
+     * El camino, uno solo: preparar el audio, transcribir, redactar, guardar.
+     *
+     * Aquí había dos copias de esto —`runGeminiFlow` y `runGroqFlow`— de unas
+     * doscientas líneas cada una y con el cuerpo idéntico salvo en las dos
+     * llamadas que hacen el trabajo. Cada arreglo había que hacerlo dos veces, y
+     * no se hacía: el título se extraía con reglas distintas en cada flujo, y el
+     * de Groq seguía buscando un formato de encabezado que su prompt ya no
+     * produce. Lo que cambia por proveedor vive ahora en `providers.ts`.
+     */
+    const runFlow = async (key: string, isCancelled: () => boolean) => {
+        const flowStart = Date.now();
+        const p = providerFor(provider);
         // El selector es único para los dos proveedores: aquí se descarta un id
-        // que no pertenezca a Gemini en vez de mandárselo y comer un 404.
-        const activeModel = resolveTranscriptionModel('gemini', transcriptionModel);
+        // que no sea de este proveedor en vez de mandárselo y comer un 404.
+        const activeModel = resolveTranscriptionModel(provider, transcriptionModel);
+        const isVideo = file!.type.startsWith('video/');
 
-        try {
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            console.log('[Gemini Flow] 🚀 Starting');
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log(`[${p.label} Flow] 🚀 Starting`);
 
-            const isVideo = file!.type.startsWith('video/');
-            progress.start({
-                provider: 'gemini',
-                fileName: file!.name,
-                fileSize: file!.size,
-                stages: ['prepare', 'upload', 'transcribe', 'organize'],
-                locale,
-            });
-            progress.beginStage('prepare', prepareDetail('preparing', isVideo));
+        // PASO 1: preparar el audio (comprimir y/o trocear).
+        //
+        // Las etapas se anuncian con las de la ruta sin trocear y se replantean
+        // en cuanto se sabe la duración: hasta después de preparar el audio no
+        // se sabe si habrá fragmentos, y por tanto si hay etapa de subida.
+        progress.start({
+            provider,
+            fileName: file!.name,
+            fileSize: file!.size,
+            stages: ['prepare', 'transcribe', 'organize'],
+            locale,
+        });
+        progress.beginStage('prepare', prepareDetail('preparing', isVideo));
+        setProcessingState('compressing');
 
-            // PASO 1: Procesar audio
-            const processingStart = Date.now();
-            const processed = await processAudioForUpload(file!, (stage, p) => {
-                if (!isCancelled()) {
-                    progress.setStage('prepare', p, prepareDetail(stage, isVideo));
-                    setProcessingProgress(p);
-                    persist(currentProjectId, {
-                        step: 'upload',
-                        subStep: 'compressing',
-                        progress: p
-                    });
-                }
-            }, {
-                provider: 'gemini',
-                forceCompression: file!.type.startsWith('video/')
-            });
-
-            const processingTime = ((Date.now() - processingStart) / 1000).toFixed(1);
-            console.log(`[Gemini Flow] ✅ Audio processed (${processingTime}s)`);
-
+        const processed = await processAudioForUpload(file!, (stage, prog) => {
             if (isCancelled()) return;
+            progress.setStage('prepare', prog, prepareDetail(stage, isVideo));
+            setProcessingProgress(prog);
+            persist(currentProjectId, { step: 'upload', subStep: 'compressing', progress: prog });
+        }, { provider, forceCompression: isVideo });
 
-            // Mostrar info de compresión si aplica
-            if (processed.wasCompressed) {
-                const saved = Math.round((1 - processed.compressedSize / processed.originalSize) * 100);
-                const sizeStr = (processed.compressedSize / (1024 * 1024)).toFixed(1);
-                const label = file!.type.startsWith('video/')
-                    ? t('notif.audio_extracted', locale)
-                    : t('notif.audio_optimized', locale);
-                setCompressionInfo(`${label}: ${sizeStr}MB (-${saved}%)`);
-            }
+        if (isCancelled()) return;
 
-            const durationMinutes = (processed.duration || 0) / 60;
-            console.log(`[Gemini Flow] Duration: ${durationMinutes.toFixed(1)} min`);
-
-            progress.setDuration(processed.duration || 0);
-            if (processed.wasCompressed) {
-                const saved = Math.round((1 - processed.compressedSize / processed.originalSize) * 100);
-                progress.pushEvent('success', isVideo
-                    ? msg(`Audio extraído del vídeo (${saved}% menos de tamaño)`, `Audio extracted from video (${saved}% smaller)`)
-                    : msg(`Audio comprimido un ${saved}%`, `Audio compressed by ${saved}%`));
-            }
-            progress.finishStage('prepare');
-
-            // PASO 2: Transcribir (con o sin chunking)
-            const transcriptionStart = Date.now();
-            setProcessingState('uploading');
-            setProcessingProgress(0);
-
-            let transcriptionResult: { text: string; tokensUsed: number };
-
-            // 🎯 DECISIÓN DE RUTA: >= 20 min usa chunking
-            if (durationMinutes >= DURATION_THRESHOLD_CHUNKING) {
-                console.log(`[Gemini Flow] Using CHUNKED strategy (>= ${DURATION_THRESHOLD_CHUNKING} min)`);
-
-                // Ruta con fragmentos: cada uno se sube por su cuenta, así que
-                // no hay una etapa de subida separada que mostrar.
-                progress.replan(['prepare', 'transcribe', 'organize']);
-                progress.beginStage('transcribe', msg('Preparando fragmentos', 'Preparing chunks'));
-
-                transcriptionResult = await transcribeWithGeminiChunked(
-                    processed.wasChunked ? processed.chunks : processed.chunks[0],
-                    key,
-                    (p) => {
-                        if (isCancelled()) return;
-                        setProcessingState('transcribing');
-                        persist(currentProjectId, {
-                            step: 'transcribing',
-                            subStep: 'transcribing',
-                            progress: p
-                        });
-                        setProcessingProgress(p);
-                    },
-                    processed.duration,
-                    processed.chunkMetadata,
-                    activeModel,
-                );
-            } else {
-                console.log(`[Gemini Flow] Using STANDARD strategy (< ${DURATION_THRESHOLD_CHUNKING} min)`);
-
-                progress.beginStage('upload', msg('Subiendo el audio a Gemini', 'Uploading the audio to Gemini'));
-
-                transcriptionResult = await transcribeWithGemini(
-                    processed.chunks[0],
-                    key,
-                    (p) => {
-                        if (isCancelled()) return;
-
-                        if (p >= 0.5 && progress.getSnapshot().activeStage === 'upload') {
-                            // El 50% del callback marca el final de la subida:
-                            // a partir de ahí el progreso lo dictan los
-                            // timestamps que emite el propio modelo.
-                            progress.finishStage('upload');
-                            progress.beginStage('transcribe', msg('Transcribiendo el audio', 'Transcribing the audio'));
-                        }
-
-                        if (p < 0.5) {
-                            setProcessingState('uploading');
-                            persist(currentProjectId, {
-                                step: 'upload',
-                                subStep: 'uploading',
-                                progress: p
-                            });
-                        } else {
-                            setProcessingState('transcribing');
-                            persist(currentProjectId, {
-                                step: 'transcribing',
-                                subStep: 'transcribing',
-                                progress: p
-                            });
-                        }
-                        setProcessingProgress(p);
-                    },
-                    processed.duration || 0,
-                    0,
-                    activeModel
-                );
-            }
-
-            const transcriptionTime = ((Date.now() - transcriptionStart) / 1000).toFixed(1);
-            console.log(`[Gemini Flow] ✅ Transcription (${transcriptionTime}s)`);
-
-            if (isCancelled()) return;
-
-            progress.finishStage('upload');
-            progress.finishStage('transcribe', msg('Transcripción completada', 'Transcription complete'));
-
-            const text = transcriptionResult.text;
-
-            if (!text || text.trim().length === 0) {
-                throw new Error(locale === 'es'
-                    ? 'La transcripción está vacía.'
-                    : 'Transcription is empty.');
-            }
-
-            setTranscription(text);
-            persist(currentProjectId, { transcription: text });
-
-            // PASO 3: Organizar notas
-            const organizationStart = Date.now();
-            setProcessingState('analyzing');
-            setStep('ai-processing');
-            setAiStep(0);
-            progress.beginStage('organize', msg('Estructurando los apuntes', 'Structuring the notes'));
-            progress.pushEvent('info', msg(
-                `Transcripción lista: ${text.length.toLocaleString()} caracteres`,
-                `Transcript ready: ${text.length.toLocaleString()} characters`,
-            ));
-
-            const organizationResult = await organizeNotesWithGemini(text, key, (s) => {
-                if (!isCancelled()) {
-                    setAiStep(s);
-                    // Gemini organiza sin streaming: sin esto la barra se
-                    // quedaba clavada durante todo el minuto largo que tarda.
-                    progress.setStage('organize', Math.min(0.95, s / 5));
-                    persist(currentProjectId, {
-                        step: 'ai-processing',
-                        progress: s / 5
-                    });
-                }
-            }, summaryLevel, outputLanguage);
-
-            const organizationTime = ((Date.now() - organizationStart) / 1000).toFixed(1);
-            console.log(`[Gemini Flow] ✅ Organization (${organizationTime}s)`);
-
-            if (isCancelled()) return;
-
-            const notes = organizationResult.notes;
-
-            // Extraer título — busca primero el # h1, si el modelo lo omitió usa el primer ## h2
-            let cleanNotes = notes;
-            let resolvedTitle = '';
-            const titleMatch = notes.match(/^#\s+(.+)/m);
-            if (titleMatch) {
-                resolvedTitle = titleMatch[1].trim();
-                cleanNotes = notes.replace(/^#\s+.+\n+/, '').trim();
-            } else {
-                // Fallback: el modelo saltó el # título — usar el primer ## encabezado
-                const h2Match = notes.match(/^##\s+(.+)/m);
-                if (h2Match) {
-                    resolvedTitle = h2Match[1].trim().replace(/^\d+\.\s*/, ''); // quitar "1. " si existe
-                    console.warn('[Gemini Flow] ⚠️  No # title found, using first ## as title:', resolvedTitle);
-                }
-                // cleanNotes queda igual — no hay nada que remover
-            }
-            if (resolvedTitle) setTitle(resolvedTitle);
-
-            setOrganizedNotes(cleanNotes);
-            setProcessingState('done');
-            progress.finishStage('organize');
-            progress.finish();
-
-            // Actualizar DB
-            persist(currentProjectId, {
-                step: 'editor',
-                subStep: 'done',
-                progress: 1,
-                organizedNotes: cleanNotes,
-                metadata: {
-                    processingMode: durationMinutes >= DURATION_THRESHOLD_CHUNKING ? 'chunked-transcription' : 'standard-transcription',
-                    durationMinutes: durationMinutes.toFixed(1)
-                }
-            });
-            if (currentProjectId) {
-                // El título guardado es el mismo que ve el usuario: antes, si el
-                // modelo omitía el `#` y se recurría al primer `##`, la pantalla
-                // mostraba uno y la lista de proyectos guardaba 'Untitled Note'.
-                db.projects.update(currentProjectId, {
-                    status: 'done',
-                    title: resolvedTitle || file?.name || 'Untitled Note'
-                }).catch((e) => console.warn('[Processor] No se pudo guardar el título:', e));
-            }
-
-            playNotificationSound();
-            setStep('editor');
-
-            const totalTime = ((Date.now() - flowStartTime) / 1000).toFixed(1);
-            const totalTokens = transcriptionResult.tokensUsed + organizationResult.tokensUsed;
-
-            // LOG FINAL CON RESUMEN DE TOKENS
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            console.log('[Gemini Flow] ✅ COMPLETE');
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            console.log(`[Gemini Flow] Total time: ${totalTime}s`);
-            console.log(`[Gemini Flow] Breakdown:`);
-            console.log(`  • Processing: ${processingTime}s`);
-            console.log(`  • Transcription: ${transcriptionTime}s`);
-            console.log(`  • Organization: ${organizationTime}s`);
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            console.log(`[Gemini Flow] 🎯 TOTAL OUTPUT TOKENS: ${totalTokens.toLocaleString()}`);
-            console.log(`  • Transcription: ${transcriptionResult.tokensUsed.toLocaleString()}`);
-            console.log(`  • Organization: ${organizationResult.tokensUsed.toLocaleString()}`);
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
-        } catch (err: any) {
-            throw err;
+        if (processed.wasCompressed) {
+            const saved = Math.round((1 - processed.compressedSize / processed.originalSize) * 100);
+            const sizeStr = (processed.compressedSize / (1024 * 1024)).toFixed(1);
+            const label = isVideo ? t('notif.audio_extracted', locale) : t('notif.audio_optimized', locale);
+            const chunkNote = processed.wasChunked
+                ? ` · ${processed.chunks.length} ${t('notif.chunks', locale)}`
+                : '';
+            setCompressionInfo(`${label}: ${sizeStr}MB (-${saved}%)${chunkNote}`);
+            progress.pushEvent('success', isVideo
+                ? msg(`Audio extraído del vídeo (${saved}% menos de tamaño)`, `Audio extracted from video (${saved}% smaller)`)
+                : msg(`Audio comprimido un ${saved}%`, `Audio compressed by ${saved}%`));
         }
-    };
 
-    const runGroqFlow = async (key: string, isCancelled: () => boolean) => {
-        const activeModel = resolveTranscriptionModel('groq', transcriptionModel);
-        try {
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            console.log('[Groq Flow] 🚀 Starting');
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        const durationMinutes = (processed.duration || 0) / 60;
+        progress.setDuration(processed.duration || 0);
+        progress.replan(p.stagesFor(processed));
+        progress.finishStage('prepare');
 
-            const isVideo = file!.type.startsWith('video/');
-            progress.start({
-                provider: 'groq',
-                fileName: file!.name,
-                fileSize: file!.size,
-                stages: ['prepare', 'transcribe', 'organize'],
-                locale,
-            });
-            progress.beginStage('prepare', prepareDetail('preparing', isVideo));
+        // PASO 2: transcribir.
+        const transcriptionStart = Date.now();
+        setProcessingState('uploading');
+        setProcessingProgress(0);
 
-            // PASO 1: Procesar audio (comprimir y chunkear si es necesario)
-            setProcessingState('compressing');
-            const processed = await processAudioForUpload(file!, (stage, p) => {
-                if (!isCancelled()) {
-                    progress.setStage('prepare', p, prepareDetail(stage, isVideo));
-                    setProcessingProgress(p);
-                    persist(currentProjectId, {
-                        step: 'upload',
-                        subStep: 'compressing',
-                        progress: p
-                    });
+        const stages = p.stagesFor(processed);
+        const hasUploadStage = stages.includes('upload');
+        progress.beginStage(
+            hasUploadStage ? 'upload' : 'transcribe',
+            hasUploadStage
+                ? msg('Subiendo el audio', 'Uploading the audio')
+                : msg('Transcribiendo el audio', 'Transcribing the audio'),
+        );
+
+        const transcription = await p.transcribe({
+            processed,
+            apiKey: key,
+            model: activeModel,
+            onProgress: (prog, phase) => {
+                if (isCancelled()) return;
+                if (phase === 'transcribe' && progress.getSnapshot().activeStage === 'upload') {
+                    progress.finishStage('upload');
+                    progress.beginStage('transcribe', msg('Transcribiendo el audio', 'Transcribing the audio'));
                 }
-            }, {
-                provider: 'groq',
-                forceCompression: file!.type.startsWith('video/')
-            });
-
-            if (isCancelled()) return;
-
-            // Mostrar info de compresión
-            if (processed.wasCompressed) {
-                const saved = Math.round((1 - processed.compressedSize / processed.originalSize) * 100);
-                const sizeStr = (processed.compressedSize / (1024 * 1024)).toFixed(1);
-                const label = file!.type.startsWith('video/')
-                    ? t('notif.audio_extracted', locale)
-                    : t('notif.audio_optimized', locale);
-                const fragmentsLabel = t('notif.chunks', locale);
-
-                setCompressionInfo(
-                    `${label}: ${sizeStr}MB (-${saved}%)${processed.wasChunked ? ` · ${processed.chunks.length} ${fragmentsLabel}` : ''}`
-                );
-            }
-
-            progress.setDuration(processed.duration || 0);
-            if (processed.wasCompressed) {
-                const saved = Math.round((1 - processed.compressedSize / processed.originalSize) * 100);
-                progress.pushEvent('success', isVideo
-                    ? msg(`Audio extraído del vídeo (${saved}% menos de tamaño)`, `Audio extracted from video (${saved}% smaller)`)
-                    : msg(`Audio comprimido un ${saved}%`, `Audio compressed by ${saved}%`));
-            }
-            progress.finishStage('prepare');
-
-            // Reparto temporal de los fragmentos: Whisper los procesa en serie,
-            // así que el tablero necesita saber qué trozo de audio cubre cada uno.
-            // Si no se pudo leer la duración, se reparte a partes iguales: el
-            // tablero sigue siendo útil ("fragmento 2 de 5") aunque no haya
-            // minutos que mostrar.
-            const totalSec = processed.duration || processed.chunks.length * 60;
-            const chunkSeconds: number[] = [];
-            let ranges: { startSec: number; endSec: number }[];
-
-            if (processed.chunkMetadata?.length === processed.chunks.length) {
-                // Troceado temporal: los tiempos son exactos y no hay que
-                // deducirlos del tamaño de cada fragmento.
-                ranges = processed.chunkMetadata.map((meta) => {
-                    chunkSeconds.push(meta.endTime - meta.startTime);
-                    return { startSec: meta.startTime, endSec: meta.endTime };
+                setProcessingState(phase === 'upload' ? 'uploading' : 'transcribing');
+                setProcessingProgress(prog);
+                persist(currentProjectId, {
+                    step: phase === 'upload' ? 'upload' : 'transcribing',
+                    subStep: phase === 'upload' ? 'uploading' : 'transcribing',
+                    progress: prog,
                 });
-            } else {
-                const totalBytes = processed.chunks.reduce((sum, c) => sum + c.size, 0) || 1;
-                let cursor = 0;
-                ranges = processed.chunks.map((c) => {
-                    const span = totalSec * (c.size / totalBytes);
-                    const range = { startSec: cursor, endSec: cursor + span };
-                    chunkSeconds.push(span);
-                    cursor += span;
-                    return range;
-                });
-            }
-            progress.initChunks(ranges);
-            if (processed.chunks.length > 1) {
-                progress.pushEvent('info', msg(
-                    `Audio dividido en ${processed.chunks.length} fragmentos de ~25 MB`,
-                    `Audio split into ${processed.chunks.length} chunks of ~25 MB`,
-                ));
-            }
+            },
+        });
 
-            // PASO 2: Transcribir con Groq (Whisper)
-            setProcessingState('transcribing');
-            progress.beginStage('transcribe', msg('Transcribiendo con Whisper', 'Transcribing with Whisper'));
-            setProcessingProgress(0.05);
-            persist(currentProjectId, {
-                step: 'transcribing',
-                subStep: 'initializing',
-                progress: 0.05
-            });
+        if (isCancelled()) return;
 
-            const text = await transcribeAudio(processed.chunks, key, (p) => {
-                if (!isCancelled()) {
-                    setProcessingProgress(p);
-                    persist(currentProjectId, {
-                        step: 'transcribing',
-                        progress: p
-                    });
-                }
-            }, chunkSeconds, activeModel);
+        console.log(`[${p.label} Flow] ✅ Transcription (${((Date.now() - transcriptionStart) / 1000).toFixed(1)}s)`);
 
-            if (isCancelled()) return;
+        progress.finishStage('upload');
+        progress.finishStage('transcribe', msg('Transcripción completada', 'Transcription complete'));
 
-            console.log('[Groq Flow] Transcription complete:', text.length, 'chars');
-
-            if (!text || text.trim().length === 0) {
-                throw new Error(locale === 'es'
-                    ? 'La transcripción está vacía.'
-                    : 'Transcription is empty.');
-            }
-
-            setTranscription(text);
-            persist(currentProjectId, { transcription: text });
-
-            progress.finishStage('transcribe', msg('Transcripción completada', 'Transcription complete'));
-
-            // PASO 3: Organizar notas con Groq
-            setProcessingState('analyzing');
-            setStep('ai-processing');
-            setAiStep(0);
-            progress.beginStage('organize', msg('Estructurando los apuntes', 'Structuring the notes'));
-            progress.pushEvent('info', msg(
-                `Transcripción lista: ${text.length.toLocaleString()} caracteres`,
-                `Transcript ready: ${text.length.toLocaleString()} characters`,
-            ));
-
-            const notes = await organizeNotes(text, key, (s) => {
-                if (!isCancelled()) {
-                    setAiStep(s);
-                    persist(currentProjectId, {
-                        step: 'ai-processing',
-                        progress: s / 5
-                    });
-                }
-            }, summaryLevel, outputLanguage);
-
-            if (isCancelled()) return;
-
-            // Extraer título — busca primero el formato Groq (## Título), luego # h1, luego ## h2 como fallback
-            let cleanNotes = notes;
-            let resolvedTitle = '';
-            const titleMatch = notes.match(/^## Título\s*\n(.+)/m);
-            if (titleMatch) {
-                resolvedTitle = titleMatch[1].trim().replace(/\*\*/g, '');
-                cleanNotes = notes.replace(/^## Título\s*\n.+\n*/m, '').trim();
-            } else {
-                // Fallback: buscar # h1 (por si Groq cambia formato) o primer ## h2
-                const h1Match = notes.match(/^#\s+(.+)/m);
-                if (h1Match) {
-                    resolvedTitle = h1Match[1].trim();
-                    cleanNotes = notes.replace(/^#\s+.+\n+/, '').trim();
-                } else {
-                    const h2Match = notes.match(/^##\s+(.+)/m);
-                    if (h2Match) {
-                        resolvedTitle = h2Match[1].trim().replace(/^\d+\.\s*/, '');
-                        console.warn('[Groq Flow] ⚠️  No title heading found, using first ## as title:', resolvedTitle);
-                    }
-                }
-            }
-            if (resolvedTitle) setTitle(resolvedTitle);
-
-            setOrganizedNotes(cleanNotes);
-            setProcessingState('done');
-            progress.finishStage('organize');
-            progress.finish();
-
-            // Actualizar DB
-            persist(currentProjectId, {
-                step: 'editor',
-                subStep: 'done',
-                progress: 1,
-                organizedNotes: cleanNotes
-            });
-            if (currentProjectId) {
-                db.projects.update(currentProjectId, {
-                    status: 'done',
-                    title: resolvedTitle || file?.name || 'Untitled Note'
-                }).catch((e) => console.warn('[Processor] No se pudo guardar el título:', e));
-            }
-
-            playNotificationSound();
-            setStep('editor');
-            console.log('[Groq Flow] ✅ Complete');
-            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
-        } catch (err: any) {
-            console.error('[Groq Flow] Error:', err);
-            throw err;
+        const text = transcription.text;
+        if (!text || text.trim().length === 0) {
+            throw new Error(locale === 'es' ? 'La transcripción está vacía.' : 'Transcription is empty.');
         }
+
+        setTranscription(text);
+        persist(currentProjectId, { transcription: text });
+
+        // PASO 3: redactar los apuntes.
+        const organizeStart = Date.now();
+        setProcessingState('analyzing');
+        setStep('ai-processing');
+        setAiStep(0);
+        progress.beginStage('organize', msg('Estructurando los apuntes', 'Structuring the notes'));
+        progress.pushEvent('info', msg(
+            `Transcripción lista: ${text.length.toLocaleString()} caracteres`,
+            `Transcript ready: ${text.length.toLocaleString()} characters`,
+        ));
+
+        const organized = await p.organize({
+            transcription: text,
+            apiKey: key,
+            summaryLevel,
+            outputLanguage,
+            onStep: (s) => {
+                if (isCancelled()) return;
+                setAiStep(s);
+                progress.setStage('organize', Math.min(0.95, s / 5));
+                persist(currentProjectId, { step: 'ai-processing', progress: s / 5 });
+            },
+        });
+
+        if (isCancelled()) return;
+
+        console.log(`[${p.label} Flow] ✅ Organization (${((Date.now() - organizeStart) / 1000).toFixed(1)}s)`);
+
+        // PASO 4: título, guardado y aviso.
+        const { title: resolvedTitle, body: cleanNotes } = splitTitle(organized.notes);
+        if (resolvedTitle) setTitle(resolvedTitle);
+
+        setOrganizedNotes(cleanNotes);
+        setProcessingState('done');
+        progress.finishStage('organize');
+        progress.finish();
+
+        persist(currentProjectId, {
+            step: 'editor',
+            subStep: 'done',
+            progress: 1,
+            organizedNotes: cleanNotes,
+            metadata: { provider, durationMinutes: durationMinutes.toFixed(1) },
+        });
+        if (currentProjectId) {
+            // El título guardado es el mismo que ve el usuario: antes, si el
+            // modelo omitía el `#` y se recurría al primer `##`, la pantalla
+            // mostraba uno y la lista de proyectos guardaba 'Untitled Note'.
+            db.projects.update(currentProjectId, {
+                status: 'done',
+                title: resolvedTitle || file?.name || 'Untitled Note',
+            }).catch((e) => console.warn('[Processor] No se pudo guardar el título:', e));
+        }
+
+        playNotificationSound();
+        setStep('editor');
+
+        const totalTokens = transcription.tokensUsed + organized.tokensUsed;
+        console.log(`[${p.label} Flow] ✅ COMPLETE — ${((Date.now() - flowStart) / 1000).toFixed(1)}s`
+            + (totalTokens ? ` · ${totalTokens.toLocaleString()} tokens de salida` : ''));
     };
 
     return null; // Headless component

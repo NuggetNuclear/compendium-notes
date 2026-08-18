@@ -13,7 +13,6 @@ import SearchableLanguageSelect from './SearchableLanguageSelect';
  * todo el mundo; el resto está para quien sabe lo que hace. Por encima de 6 la
  * propia capa de red recorta, así que ofrecer 10 sería mentir.
  */
-const CONCURRENCY_OPTIONS = [0, 1, 2, 3, 4, 6] as const;
 
 export default function ConfigModal() {
     const {
@@ -22,8 +21,7 @@ export default function ConfigModal() {
         pdfStyle, setPdfStyle, locale, processingState,
         summaryLevel, setSummaryLevel,
         outputLanguage, setOutputLanguage,
-        transcriptionModel, setTranscriptionModel,
-        chunkConcurrency, setChunkConcurrency
+        transcriptionModel, setTranscriptionModel
     } = useAppStore();
 
     const isProcessing = processingState !== 'idle' && processingState !== 'done' && processingState !== 'error';
@@ -53,7 +51,7 @@ export default function ConfigModal() {
                     setValidating(false);
                     return;
                 }
-                await setApiKey(groqInput.trim());
+                setApiKey(groqInput.trim());
                 setGroqInput('');
             }
 
@@ -64,7 +62,7 @@ export default function ConfigModal() {
                     setValidating(false);
                     return;
                 }
-                await setGeminiKey(geminiInput.trim());
+                setGeminiKey(geminiInput.trim());
                 setGeminiInput('');
             }
 
@@ -354,37 +352,6 @@ export default function ConfigModal() {
                             <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3" style={{ color: 'var(--text-muted)' }}>
                                 <ChevronDown size={14} />
                             </div>
-                        </div>
-                    </div>
-
-                    {/* Fragmentos simultáneos */}
-                    <div>
-                        <label className="text-xs font-medium mb-1 block" style={{ color: 'var(--text-secondary)' }}>
-                            {t('app.config.concurrency', locale)}
-                        </label>
-                        <p className="text-[11px] mb-2 leading-tight" style={{ color: 'var(--text-muted)' }}>
-                            {t('app.config.concurrency.desc', locale)}
-                        </p>
-                        <div className="grid grid-cols-3 gap-1.5">
-                            {CONCURRENCY_OPTIONS.map((n) => {
-                                const activo = chunkConcurrency === n;
-                                return (
-                                    <button
-                                        key={n}
-                                        disabled={isProcessing}
-                                        onClick={() => setChunkConcurrency(n)}
-                                        aria-pressed={activo}
-                                        className={`py-2 rounded-lg text-xs font-medium transition-all ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                        style={{
-                                            background: activo ? 'var(--accent-subtle)' : 'var(--bg-primary)',
-                                            border: `1px solid ${activo && !isProcessing ? 'var(--accent)' : 'var(--border-default)'}`,
-                                            color: activo ? 'var(--accent)' : 'var(--text-muted)',
-                                        }}
-                                    >
-                                        {n === 0 ? t('app.config.concurrency.auto', locale) : n}
-                                    </button>
-                                );
-                            })}
                         </div>
                     </div>
 

@@ -18,14 +18,14 @@ interface AppState {
     provider: Provider;
     setProvider: (provider: Provider) => void;
 
-    // API Keys (one per provider)
+    // API Keys (one per provider), en claro
     apiKey: string;       // Groq
-    setApiKey: (key: string) => Promise<void>;
-    geminiKey: string;    // Gemini (Encrypted)
-    setGeminiKey: (key: string) => Promise<void>;
+    setApiKey: (key: string) => void;
+    geminiKey: string;    // Gemini
+    setGeminiKey: (key: string) => void;
 
     // Active key helper
-    activeKey: () => Promise<string>;
+    activeKey: () => string;
 
     // App step
     step: AppStep;
@@ -68,17 +68,6 @@ interface AppState {
     // Transcription Model
     transcriptionModel: string;
     setTranscriptionModel: (model: string) => void;
-
-    /**
-     * Fragmentos que se transcriben a la vez. 0 = automático.
-     *
-     * Es una decisión con dos caras y por eso la toma el usuario: más
-     * simultáneos terminan antes, pero acercan la tanda al límite del free
-     * tier (15 peticiones/minuto, 250K tokens/minuto), y a partir de ahí cada
-     * reintento provoca el siguiente. El pipeline nunca sube del techo real.
-     */
-    chunkConcurrency: number;
-    setChunkConcurrency: (n: number) => void;
 
     // Config
     configOpen: boolean;
@@ -144,10 +133,27 @@ function getInitialOutputLanguage(): OutputLanguage {
 /** Veces que se reintenta retomar un proceso interrumpido antes de rendirse. */
 const MAX_RESUME_ATTEMPTS = 1;
 
-function getInitialChunkConcurrency(): number {
-    if (typeof window === 'undefined') return 0;
-    const stored = Number(localStorage.getItem('scn-chunk-concurrency'));
-    return Number.isFinite(stored) && stored > 0 ? Math.min(8, Math.round(stored)) : 0;
+/**
+ * Las API Keys se guardaban cifradas con AES-GCM… y la clave de cifrado vivía
+ * en el mismo IndexedDB del navegador, al lado del texto cifrado. Quien pudiera
+ * leer una podía leer la otra: no protegía de nada y costaba 126 líneas. Ahora
+ * van en claro, que es lo que siempre fueron.
+ *
+ * Lo que quedara cifrado de antes ya no se puede leer, y mandarlo tal cual a la
+ * API sólo daría un "API Key inválida" incomprensible. Se descarta una vez y se
+ * vuelve a pedir.
+ */
+const KEYS_ARE_PLAIN = 'scn-keys-plain';
+
+function readKey(name: string): string {
+    if (typeof window === 'undefined') return '';
+    if (!localStorage.getItem(KEYS_ARE_PLAIN)) {
+        localStorage.removeItem('scn-api-key');
+        localStorage.removeItem('scn-gemini-key');
+        localStorage.setItem(KEYS_ARE_PLAIN, '1');
+        return '';
+    }
+    return localStorage.getItem(name) || '';
 }
 
 function getInitialTranscriptionModel(): string {
@@ -160,7 +166,6 @@ function getInitialTranscriptionModel(): string {
 import { db, createProject, saveAudioSource, getActiveProject } from './db';
 import { progress } from './progress';
 import { abortRun } from './pipeline-control';
-import { encryptData, decryptData } from './crypto';
 
 export const useAppStore = create<AppState>()(
     persist(
@@ -200,53 +205,27 @@ export const useAppStore = create<AppState>()(
                 set({ transcriptionModel });
             },
 
-            chunkConcurrency: getInitialChunkConcurrency(),
-            setChunkConcurrency: (chunkConcurrency) => {
-                if (typeof window !== 'undefined') localStorage.setItem('scn-chunk-concurrency', String(chunkConcurrency));
-                set({ chunkConcurrency });
-            },
-
-            apiKey: typeof window !== 'undefined' ? localStorage.getItem('scn-api-key') || '' : '',
-            setApiKey: async (apiKey) => {
+            apiKey: readKey('scn-api-key'),
+            setApiKey: (apiKey) => {
                 if (typeof window !== 'undefined') {
-                    if (!apiKey) {
-                        localStorage.removeItem('scn-api-key');
-                        set({ apiKey: '' });
-                        return;
-                    }
-                    // Encrypt before storing
-                    const encrypted = await encryptData(apiKey);
-                    localStorage.setItem('scn-api-key', encrypted);
-                    set({ apiKey: encrypted }); // Store encrypted in state too (UI should decode if needed, but usually we just need it for requests)
+                    if (apiKey) localStorage.setItem('scn-api-key', apiKey);
+                    else localStorage.removeItem('scn-api-key');
                 }
+                set({ apiKey });
             },
 
-            geminiKey: typeof window !== 'undefined' ? localStorage.getItem('scn-gemini-key') || '' : '',
-            setGeminiKey: async (geminiKey) => {
+            geminiKey: readKey('scn-gemini-key'),
+            setGeminiKey: (geminiKey) => {
                 if (typeof window !== 'undefined') {
-                    if (!geminiKey) {
-                        localStorage.removeItem('scn-gemini-key');
-                        set({ geminiKey: '' });
-                        return;
-                    }
-                    const encrypted = await encryptData(geminiKey);
-                    localStorage.setItem('scn-gemini-key', encrypted);
-                    set({ geminiKey: encrypted });
+                    if (geminiKey) localStorage.setItem('scn-gemini-key', geminiKey);
+                    else localStorage.removeItem('scn-gemini-key');
                 }
+                set({ geminiKey });
             },
 
-            activeKey: async () => {
+            activeKey: () => {
                 const state = get();
-                const encrypted = state.provider === 'gemini' ? state.geminiKey : state.apiKey;
-                if (!encrypted) return '';
-
-                // Decrypt on demand
-                try {
-                    return await decryptData(encrypted);
-                } catch (e) {
-                    console.error('Failed to decrypt key', e);
-                    return '';
-                }
+                return (state.provider === 'gemini' ? state.geminiKey : state.apiKey) || '';
             },
 
             step: 'upload',
@@ -295,7 +274,7 @@ export const useAppStore = create<AppState>()(
 
             startProcessing: async (file) => {
                 const state = get();
-                const key = await state.activeKey();
+                const key = state.activeKey();
 
                 if (!key) {
                     console.warn('[Store] 🚫 Cannot start: Missing API Key');
@@ -402,7 +381,7 @@ export const useAppStore = create<AppState>()(
                         // Note: The rest of the state (transcription, notes) is handled by zustand persist
                         // But we might need to nudge the GlobalAudioProcessor to resume if state was mid-process
                         if (active.project.status === 'processing') {
-                            const key = await get().activeKey();
+                            const key = get().activeKey();
                             if (!key) {
                                 console.warn('Cannot resume: No API Key found');
                                 // Reset project status in DB so it doesn't try again

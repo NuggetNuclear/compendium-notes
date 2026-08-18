@@ -255,12 +255,6 @@ export const translations = {
         es: 'Auto empieza por el primero y cambia solo si falla. Con uno fijo, se intenta ese primero.',
         en: 'Auto starts with the first one and switches only if it fails. A fixed model is simply tried first.'
     },
-    'app.config.concurrency': { es: 'Fragmentos a la vez', en: 'Chunks at a time' },
-    'app.config.concurrency.desc': {
-        es: 'Las grabaciones largas se parten en fragmentos de 10 minutos. Cuantos más se transcriban a la vez, antes termina — pero el plan gratuito admite 15 peticiones por minuto, y pasarse provoca esperas que lo hacen más lento.',
-        en: 'Long recordings are split into 10-minute chunks. The more you transcribe at once the sooner it finishes — but the free plan allows 15 requests per minute, and going over triggers waits that make it slower.'
-    },
-    'app.config.concurrency.auto': { es: 'Automático', en: 'Automatic' },
     'app.config.groq.get': { es: 'Obtener API Key de Groq', en: 'Get Groq API Key' },
     'app.config.gemini.get': { es: 'Obtener API Key de Gemini', en: 'Get Gemini API Key' },
     'app.config.close': { es: 'Cerrar', en: 'Close' },

@@ -42,7 +42,6 @@ export class CompendiumDB extends Dexie {
     projects!: Table<Project>;
     audioSource!: Table<AudioSource>;
     processingState!: Table<ProcessingState>;
-    secrets!: Table<{ key: string; value: any }>;
 
     constructor() {
         super('CompendiumDB');
@@ -52,6 +51,10 @@ export class CompendiumDB extends Dexie {
             processingState: '++id, projectId', // Link to project
             secrets: 'key' // Key-Value store for secrets
         });
+        // v2: las API Keys ya no se cifran, así que no hay clave maestra que
+        // guardar. Se borra la tabla en lugar de dejarla ahí con la clave de
+        // un cifrado que ya no se usa.
+        this.version(2).stores({ secrets: null });
     }
 }
 

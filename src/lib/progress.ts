@@ -119,8 +119,6 @@ export interface ProgressSnapshot {
 // Calibración: expectativas por etapa, ajustadas con lo observado
 // ---------------------------------------------------------------------------
 
-const PERF_KEY = 'scn-perf-v1';
-
 /** Coste esperado por minuto de audio, en ms. Punto de partida razonable. */
 const BASE_MS_PER_AUDIO_MIN: Record<string, Record<StageId, number>> = {
     groq: { prepare: 900, upload: 0, transcribe: 1400, organize: 700 },
@@ -135,35 +133,13 @@ const FLOOR_MS: Record<StageId, number> = {
     organize: 12000,
 };
 
-type Calibration = Record<string, Partial<Record<StageId, number>>>;
-
-function readCalibration(): Calibration {
-    if (typeof localStorage === 'undefined') return {};
-    try {
-        return JSON.parse(localStorage.getItem(PERF_KEY) || '{}');
-    } catch {
-        return {};
-    }
-}
-
 /**
- * Guarda el ratio real/esperado de una etapa como media móvil exponencial.
- * Con dos o tres ejecuciones la ETA deja de ser un adivinanza.
+ * Aquí vivía una calibración: se guardaba en `localStorage` la media móvil
+ * exponencial del ratio real/esperado de cada etapa, por proveedor, para afinar
+ * la estimación. Sesenta líneas de estado aprendido para alimentar un número
+ * que la pantalla enseña como "Unos 3 minutos". La estimación redondeada sale
+ * igual de la tabla de arriba, y sin estado que pueda quedarse corrupto.
  */
-function writeCalibration(provider: string, stage: StageId, ratio: number) {
-    if (typeof localStorage === 'undefined') return;
-    if (!isFinite(ratio) || ratio <= 0) return;
-    const clamped = Math.min(5, Math.max(0.2, ratio));
-    try {
-        const cal = readCalibration();
-        const prev = cal[provider]?.[stage] ?? 1;
-        cal[provider] = { ...cal[provider], [stage]: prev * 0.7 + clamped * 0.3 };
-        localStorage.setItem(PERF_KEY, JSON.stringify(cal));
-    } catch {
-        /* localStorage lleno o bloqueado: la calibración es opcional */
-    }
-}
-
 export function expectedStageMs(
     provider: 'groq' | 'gemini',
     stage: StageId,
@@ -171,10 +147,8 @@ export function expectedStageMs(
 ): number {
     const base = BASE_MS_PER_AUDIO_MIN[provider]?.[stage] ?? 0;
     if (base === 0) return 0;
-    const raw = readCalibration()[provider]?.[stage] ?? 1;
-    const factor = Number.isFinite(raw) && raw > 0 ? raw : 1;
     const minutes = Number.isFinite(audioMinutes) ? Math.max(1, audioMinutes) : 1;
-    return Math.max(FLOOR_MS[stage], base * minutes * factor);
+    return Math.max(FLOOR_MS[stage], base * minutes);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,10 +376,6 @@ class ProgressTracker {
         s.status = 'done';
         s.endedAt = Date.now();
         if (detail !== undefined) s.detail = detail;
-        // Calibrar: cuánto se desvió de lo esperado.
-        if (s.startedAt && this.snap.provider && s.expectedMs > 0) {
-            writeCalibration(this.snap.provider, s.id, (s.endedAt - s.startedAt) / s.expectedMs);
-        }
         if (this.snap.activeStage === id) this.snap.activeStage = null;
         this.snap.waitUntil = null;
         this.snap.waitReason = null;

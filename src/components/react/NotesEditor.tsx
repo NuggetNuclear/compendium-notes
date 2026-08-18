@@ -120,15 +120,11 @@ export default function NotesEditor() {
         //    sean confundidas con el título cuando el idioma no es español.
         if (title) return title;
 
-        // 2. Formato legacy Groq: ## Título \n <texto>
-        const explicitMatch = editedNotes.match(/^## T[íi]tulo\s*\n+([^\n]+)/m);
-        if (explicitMatch) return explicitMatch[1].trim().replace(/\*\*/g, '');
-
-        // 3. Primer # h1 real en el contenido (no ## secciones)
+        // 2. Primer # h1 real en el contenido (no ## secciones)
         const h1Match = editedNotes.match(/^\s*#\s+([^\n]+)/m);
         if (h1Match) return h1Match[1].trim().replace(/\*\*/g, '');
 
-        // 4. Fallback al nombre de archivo
+        // 3. Fallback al nombre de archivo
         return file?.name?.replace(/\.[^.]+$/, '') || 'Untitled Note';
     }, [title, editedNotes, file]);
 
@@ -540,7 +536,7 @@ export default function NotesEditor() {
                                                     setShowResummarize(false);
                                                     setIsResummarizing(true);
                                                     try {
-                                                        const key = await activeKey();
+                                                        const key = activeKey();
                                                         if (!key) throw new Error('API Key missing');
 
                                                         if (provider === 'gemini') {

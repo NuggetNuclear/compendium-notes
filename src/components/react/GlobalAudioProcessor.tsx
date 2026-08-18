@@ -88,7 +88,7 @@ export default function GlobalAudioProcessor() {
         setOrganizedNotes, setAiStep, setTitle,
         currentProjectId, restoreSession,
         activeKey, summaryLevel, outputLanguage,
-        transcriptionModel, chunkConcurrency
+        transcriptionModel
     } = useAppStore();
 
     // Restaurar sesión al montar
@@ -119,7 +119,7 @@ export default function GlobalAudioProcessor() {
             const isCancelled = () => isAborted();
 
             // Obtener API key desencriptada
-            const key = await activeKey();
+            const key = activeKey();
 
             if (!key) {
                 setError(locale === 'es' ? 'Falta API Key' : 'API Key missing');
@@ -258,7 +258,6 @@ export default function GlobalAudioProcessor() {
                     processed.duration,
                     processed.chunkMetadata,
                     activeModel,
-                    chunkConcurrency,
                 );
             } else {
                 console.log(`[Gemini Flow] Using STANDARD strategy (< ${DURATION_THRESHOLD_CHUNKING} min)`);

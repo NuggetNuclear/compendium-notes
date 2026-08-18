@@ -86,7 +86,11 @@ describe('transcripción por fragmentos', () => {
             installMocks((c, x) =>
                 c.uris.includes(x.uriOf(2)) ? badRequest() : geminiStream(fakeTranscript(0, 1200)));
             const r = await run();
-            expect(r.text).toContain('Falta el audio de [40:00] a [01:00:00]');
+            // Sin corchetes a propósito: el aviso convive con la transcripción,
+            // y lo que cose los fragmentos busca marcas `[MM:SS]` para saber
+            // qué tiempo cubre cada línea. Un aviso entre corchetes se leía
+            // como texto transcrito y se colaba con el tiempo cambiado.
+            expect(r.text).toContain('Falta el audio de 40:00 a 01:00:00');
         });
 
         it('sólo lanza error si no se salvó ningún fragmento', async () => {

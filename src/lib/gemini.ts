@@ -222,198 +222,84 @@ export const DURATION_THRESHOLD_CHUNKING = CHUNK_SIZE_MINUTES;
 export const CHUNK_OVERLAP_SECONDS = 15;
 
 /**
- * Ajustar todos los timestamps en una transcripción sumando un offset en minutos
+ * `08:31` en vez de `[08:31]`, para los AVISOS.
+ *
+ * Los avisos ("falta el audio de X a Y") se mezclan con la transcripción, y lo
+ * que cose los fragmentos busca marcas de tiempo entre corchetes. Un aviso con
+ * corchetes se leía como si fuera texto transcrito en ese minuto y se colaba en
+ * la costura con el tiempo cambiado.
  */
-function adjustTimestamps(text: string, offsetMinutes: number): string {
-    if (offsetMinutes === 0) return text;
+const plainLabel = (seconds: number) => secondsToLabel(seconds).slice(1, -1);
 
-    const timestampPattern = /\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g;
-
-    return text.replace(timestampPattern, (match, part1, part2, part3) => {
-        let totalSeconds: number;
-
-        if (part3 !== undefined) {
-            // Formato HH:MM:SS
-            const hours = parseInt(part1, 10);
-            const minutes = parseInt(part2, 10);
-            const seconds = parseInt(part3, 10);
-            totalSeconds = hours * 3600 + minutes * 60 + seconds;
-        } else {
-            // Formato MM:SS
-            const minutes = parseInt(part1, 10);
-            const seconds = parseInt(part2, 10);
-            totalSeconds = minutes * 60 + seconds;
-        }
-
-        // Sumar offset
-        totalSeconds += offsetMinutes * 60;
-
-        // Convertir de vuelta
-        const finalHours = Math.floor(totalSeconds / 3600);
-        const finalMinutes = Math.floor((totalSeconds % 3600) / 60);
-        const finalSeconds = totalSeconds % 60;
-
-        if (finalHours > 0) {
-            return `[${finalHours.toString().padStart(2, '0')}:${finalMinutes.toString().padStart(2, '0')}:${finalSeconds.toString().padStart(2, '0')}]`;
-        } else {
-            return `[${finalMinutes.toString().padStart(2, '0')}:${finalSeconds.toString().padStart(2, '0')}]`;
-        }
-    });
+/** Una marca `[MM:SS]` / `[HH:MM:SS]` y el texto que va detrás. */
+interface Segment {
+    /** Segundos desde el inicio del audio COMPLETO. */
+    at: number;
+    body: string;
 }
 
-/**
- * Extraer segmentos (timestamp + contenido) de una transcripción
- */
-interface TranscriptSegment {
-    timestamp: string;
-    content: string;
-}
+/** Trocea una transcripción por sus marcas de tiempo. Sin marcas, sin segmentos. */
+function segmentsOf(text: string): Segment[] {
+    const re = /\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g;
+    const segments: Segment[] = [];
+    let open: { at: number; from: number } | null = null;
+    let match: RegExpExecArray | null;
 
-function extractSegments(text: string): TranscriptSegment[] {
-    const segments: TranscriptSegment[] = [];
-    const timestampPattern = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
-
-    let match;
-    let lastIndex = 0;
-    let lastTimestamp = '';
-
-    while ((match = timestampPattern.exec(text)) !== null) {
-        // Guardar segmento anterior si existe
-        if (lastTimestamp) {
-            const content = text.substring(lastIndex, match.index).trim();
-            if (content) {
-                segments.push({ timestamp: lastTimestamp, content });
-            }
-        }
-
-        lastTimestamp = match[1];
-        lastIndex = match.index + match[0].length;
+    while ((match = re.exec(text)) !== null) {
+        const [, a, b, c] = match;
+        const at = c !== undefined
+            ? Number(a) * 3600 + Number(b) * 60 + Number(c)
+            : Number(a) * 60 + Number(b);
+        if (open) segments.push({ at: open.at, body: text.slice(open.from, match.index).trim() });
+        open = { at, from: match.index + match[0].length };
     }
-
-    // Último segmento
-    if (lastTimestamp && lastIndex < text.length) {
-        const content = text.substring(lastIndex).trim();
-        if (content) {
-            segments.push({ timestamp: lastTimestamp, content });
-        }
-    }
+    if (open) segments.push({ at: open.at, body: text.slice(open.from).trim() });
 
     return segments;
 }
 
 /**
- * Normalizar texto para comparación (minúsculas, sin puntuación extra)
+ * Cose los fragmentos en una única transcripción con tiempos absolutos.
+ *
+ * Cada fragmento se transcribe con sus tiempos contados desde sí mismo, y los
+ * fragmentos se solapan `CHUNK_OVERLAP_SECONDS` para no partir una frase por la
+ * mitad. Las dos cosas se arreglan con el mismo dato, que FFmpeg ya nos da
+ * exacto: el segundo real en que empieza cada fragmento. Se le suma a cada
+ * marca, y del fragmento siguiente se descarta lo que cae antes de donde llegó
+ * el anterior.
+ *
+ * Antes esto se decidía comparando el TEXTO de los últimos segmentos con el de
+ * los primeros y dando por duplicado lo que pasara del 85% de parecido. El
+ * solape lo transcribe el modelo dos veces, en dos peticiones distintas, así
+ * que casi nunca salía con las mismas palabras: no se reconocía, y el texto
+ * final repetía quince segundos en cada costura. El tiempo no tiene esa duda.
  */
-function normalizeForComparison(text: string): string {
-    return text.toLowerCase()
-        .replace(/[.,!?;:]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
+export function stitchChunks(chunks: { text: string; startSec: number; endSec: number }[]): string {
+    const out: string[] = [];
+    /** Segundo del audio hasta el que ya hay texto escrito. */
+    let coveredUntil = -Infinity;
 
-/**
- * Detectar y eliminar duplicación exacta entre chunks
- * Estrategia: Comparar últimos segmentos del chunk anterior con primeros del siguiente
- */
-function detectAndRemoveOverlap(chunks: Array<{ text: string; index: number; offsetMinutes: number }>): string {
-    if (chunks.length === 0) return '';
-    if (chunks.length === 1) return chunks[0].text;
+    for (const chunk of chunks) {
+        const segments = segmentsOf(chunk.text);
 
-    const results: string[] = [];
-
-    for (let i = 0; i < chunks.length; i++) {
-        let chunkText = chunks[i].text;
-
-        // Si no es el primer chunk, buscar duplicación con el anterior
-        if (i > 0) {
-            const prevChunk = chunks[i - 1].text;
-            const prevSegments = extractSegments(prevChunk);
-            const currSegments = extractSegments(chunkText);
-
-            if (prevSegments.length === 0 || currSegments.length === 0) {
-                results.push(chunkText);
-                continue;
-            }
-
-            // Tomar los últimos 3-5 segmentos del chunk anterior
-            const lastSegmentsCount = Math.min(5, prevSegments.length);
-            const lastSegments = prevSegments.slice(-lastSegmentsCount);
-
-            // Tomar los primeros 3-5 segmentos del chunk actual
-            const firstSegmentsCount = Math.min(5, currSegments.length);
-            const firstSegments = currSegments.slice(0, firstSegmentsCount);
-
-            // Buscar coincidencias
-            let overlapFound = false;
-            let removeUpToIndex = 0;
-
-            for (let j = 0; j < lastSegments.length && !overlapFound; j++) {
-                const lastContent = normalizeForComparison(lastSegments[j].content);
-
-                for (let k = 0; k < firstSegments.length; k++) {
-                    const firstContent = normalizeForComparison(firstSegments[k].content);
-
-                    // Si hay coincidencia de al menos 20 caracteres
-                    if (lastContent.length > 20 && firstContent.length > 20) {
-                        const similarity = calculateSimilarity(lastContent, firstContent);
-
-                        if (similarity > 0.85) { // 85% de similitud
-                            // Encontramos duplicación - eliminar desde el inicio hasta después de este segmento
-                            overlapFound = true;
-                            removeUpToIndex = k + 1;
-                            console.log(`[Timestamp Processor] 🧹 Detected ${Math.round(similarity * 100)}% overlap at chunk ${i}`);
-                            console.log(`[Timestamp Processor]   Prev: "${lastSegments[j].content.substring(0, 60)}..."`);
-                            console.log(`[Timestamp Processor]   Curr: "${firstSegments[k].content.substring(0, 60)}..."`);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Si encontramos overlap, eliminar segmentos duplicados
-            if (overlapFound && removeUpToIndex > 0) {
-                const remainingSegments = currSegments.slice(removeUpToIndex);
-                chunkText = remainingSegments
-                    .map(s => `[${s.timestamp}] ${s.content}`)
-                    .join('\n');
-                console.log(`[Timestamp Processor] ✂️  Removed ${removeUpToIndex} duplicate segments from chunk ${i}`);
-            }
+        // Sin marcas de tiempo no hay nada que cortar: es el aviso de un
+        // fragmento que falló, y va tal cual para que el hueco se vea.
+        if (segments.length === 0) {
+            if (chunk.text.trim()) out.push(chunk.text.trim());
+            continue;
         }
 
-        results.push(chunkText);
+        const kept = segments
+            .map((s) => ({ at: s.at + chunk.startSec, body: s.body }))
+            .filter((s) => s.body && s.at >= coveredUntil);
+
+        if (kept.length === 0) continue;
+
+        coveredUntil = Math.max(coveredUntil, chunk.endSec);
+        out.push(kept.map((s) => `${secondsToLabel(s.at)} ${s.body}`).join('\n'));
     }
 
-    return results.join('\n\n');
-}
-
-/**
- * Calcular similitud entre dos textos (Levenshtein ratio simplificado)
- */
-function calculateSimilarity(text1: string, text2: string): number {
-    // Si son idénticos
-    if (text1 === text2) return 1.0;
-
-    // Si uno contiene al otro con alta fidelidad
-    if (text1.includes(text2) || text2.includes(text1)) {
-        const shorter = Math.min(text1.length, text2.length);
-        const longer = Math.max(text1.length, text2.length);
-        return shorter / longer;
-    }
-
-    // Comparación por palabras
-    const words1 = text1.split(' ');
-    const words2 = text2.split(' ');
-
-    let matches = 0;
-    const maxLength = Math.max(words1.length, words2.length);
-
-    for (let i = 0; i < Math.min(words1.length, words2.length); i++) {
-        if (words1[i] === words2[i]) {
-            matches++;
-        }
-    }
-
-    return matches / maxLength;
+    return out.join('\n\n');
 }
 
 /**
@@ -1311,7 +1197,7 @@ export async function transcribeWithGemini(
     if (finishReason === 'MAX_TOKENS') {
         console.warn(`[${tag}] ⚠️  Hit MAX_TOKENS - Cleaning artifacts...`);
         const lastSec = lastTimestampSeconds(cleanText);
-        const lastLabel = lastSec !== null ? secondsToLabel(lastSec) : null;
+        const lastLabel = lastSec !== null ? plainLabel(lastSec) : null;
         cleanText = cleanText.replace(/(\b\w{1,4}\b)(?:\s+\1){5,}$/gi, '');
         cleanText += `\n\n[⚠️ Transcripción cortada por límite de tokens${lastLabel ? `. Falta el audio a partir de ${lastLabel}` : ''}]`;
     }
@@ -1327,16 +1213,20 @@ export async function transcribeWithGemini(
 
 /**
  * RUTA CHUNKING: transcripción en paralelo para audios largos.
- * Corta el audio en fragmentos de CHUNK_SIZE_MINUTES y los reparte entre
- * varios Flash Lite a la vez, sin pasarse del RPM/TPM del free tier.
+ *
+ * Los fragmentos llegan ya cortados POR TIEMPO desde `audio-processor`, que usa
+ * FFmpeg. Aquí sólo se reparten entre varios Flash Lite a la vez, sin pasarse
+ * del RPM/TPM del free tier, y se cosen al final.
+ *
+ * Aquí había además un troceado propio que cortaba el archivo por BYTES cuando
+ * llegaba entero (`file.slice(offset, end)`). Era el peor fallo del sistema y
+ * explicaba la mayoría de los "fragmento X falló": salvo el primero, esos
+ * trozos no son archivos de audio. Un WAV sin su cabecera RIFF no es nada, y un
+ * MP3 cortado a mitad de trama empieza con basura y sin cabecera de duración.
+ * Se le mandaban a Gemini como si fueran audio y Gemini respondía lo que podía:
+ * un error, o una transcripción inventada sobre ruido. La ruta de Groq ya había
+ * aprendido esto y trocea con FFmpeg; la de Gemini se había quedado atrás.
  */
-/** Suelo de tamaño por fragmento: impide que el bucle de troceado no avance. */
-const MIN_CHUNK_BYTES = 1024 * 1024;
-/** Tamaño por fragmento cuando no hay duración con la que calcularlo. */
-const FALLBACK_CHUNK_BYTES = 18 * 1024 * 1024;
-/** Tope duro de fragmentos: ninguna entrada válida se acerca a esto. */
-const MAX_BINARY_CHUNKS = 60;
-
 export async function transcribeWithGeminiChunked(
     file: File | File[],
     apiKey: string,
@@ -1352,82 +1242,42 @@ export async function transcribeWithGeminiChunked(
     // 1. Preparar Chunks
     console.log('[Gemini Chunked] 🧩 Starting parallel chunking');
 
-    let chunks: { blob: Blob | File, start: number, end: number, index: number, fileName: string }[] = [];
-    const isPreChunked = Array.isArray(file);
+    const isPreChunked = Array.isArray(file) && Boolean(chunkMetadata);
 
-    if (isPreChunked && chunkMetadata) {
-        // ✅ CASO A: Ya vienen los chunks (ej: desde FFmpeg en audio-processor.ts)
-        console.log(`[Gemini Chunked] Using ${file.length} pre-existing temporal chunks`);
-        chunks = file.map((f, i) => ({
-            blob: f,
-            start: chunkMetadata[i].startTime,
-            end: chunkMetadata[i].endTime,
-            index: i,
-            fileName: f.name
-        }));
-    } else {
-        // ❌ CASO B: Es un solo archivo (MP3/WAV) - Hacer chunking binario (safe)
-        const singleFile = Array.isArray(file) ? file[0] : file;
+    // Sin fragmentos por tiempo no hay nada que trocear aquí: el archivo va
+    // entero, en una sola petición. Es lo que ya ocurre con un audio corto, y es
+    // preferible a inventarse cortes: como mucho la respuesta se corta por
+    // límite de tokens, y eso se avisa y se ve.
+    const chunks: { blob: Blob | File, start: number, end: number, index: number, fileName: string }[] =
+        isPreChunked
+            ? (file as File[]).map((f, i) => ({
+                blob: f,
+                start: chunkMetadata![i].startTime,
+                end: chunkMetadata![i].endTime,
+                index: i,
+                fileName: f.name,
+            }))
+            : (() => {
+                const single = Array.isArray(file) ? file[0] : file;
+                console.warn('[Gemini Chunked] ⚠️  Sin fragmentos temporales: se transcribe el audio entero');
+                // Merece un aviso: en una sola petición, un audio largo puede
+                // no caber en el presupuesto de tokens y quedarse a medias. Se
+                // señala igualmente en el texto, pero mejor saberlo antes.
+                progress.pushEvent('warn', m(
+                    'No se pudo trocear el audio: se transcribe entero y puede quedarse corto',
+                    'The audio could not be split: transcribing it whole may cut it short',
+                ));
+                return [{
+                    blob: single,
+                    start: 0,
+                    end: sanitizeDuration(duration),
+                    index: 0,
+                    fileName: single.name,
+                }];
+            })();
 
-        // La duración es la que decide el tamaño del corte. Si llega como
-        // Infinity (WebM sin índice) o como 0, `size / duration` daba 0 bytes
-        // por fragmento y el bucle de abajo no terminaba nunca: iba llenando
-        // memoria con trozos vacíos hasta que la pestaña moría. De ahí venían
-        // el "no acaba nunca" y el reinicio del navegador.
-        const durationSeconds = sanitizeDuration(duration);
-
-        if (durationSeconds > 0) {
-            console.log(`[Gemini Chunked] Duration: ${(durationSeconds / 60).toFixed(1)} min`);
-        } else {
-            console.warn('[Gemini Chunked] ⚠️  Duración desconocida: se trocea por tamaño fijo');
-            progress.pushEvent('warn', m(
-                'No se pudo leer la duración del audio: se trocea por tamaño',
-                'Could not read the audio duration: splitting by size instead',
-            ));
-        }
-        console.log(`[Gemini Chunked] Chunk size: ${CHUNK_SIZE_MINUTES} min (Binary Splicing)`);
-
-        // Sin duración fiable se cae a un tamaño fijo por fragmento. Los
-        // tiempos que se muestren serán aproximados, pero el proceso termina.
-        const bytesPerSecond = durationSeconds > 0 ? singleFile.size / durationSeconds : 0;
-        const chunkSizeBytes = Math.max(
-            MIN_CHUNK_BYTES,
-            bytesPerSecond > 0 ? bytesPerSecond * (CHUNK_SIZE_MINUTES * 60) : FALLBACK_CHUNK_BYTES,
-        );
-        const overlapBytes = bytesPerSecond > 0 ? bytesPerSecond * CHUNK_OVERLAP_SECONDS : 0;
-        const secondsPerByte = bytesPerSecond > 0 ? 1 / bytesPerSecond : 0;
-
-        let offset = 0;
-        let index = 0;
-
-        while (offset < singleFile.size && index < MAX_BINARY_CHUNKS) {
-            let end = Math.min(offset + chunkSizeBytes, singleFile.size);
-            if (end < singleFile.size) {
-                end = Math.min(end + overlapBytes, singleFile.size);
-            }
-
-            const blob = singleFile.slice(offset, end);
-            chunks.push({
-                blob: blob,
-                start: offset * secondsPerByte,
-                end: end * secondsPerByte,
-                index,
-                fileName: singleFile.name
-            });
-
-            console.log(`[Gemini Chunked] ✂️  Chunk ${index + 1}: ${(chunks[index].start / 60).toFixed(1)}-${(chunks[index].end / 60).toFixed(1)} min (${(blob.size / 1024 / 1024).toFixed(1)}MB)`);
-
-            offset += chunkSizeBytes;
-            index++;
-        }
-
-        if (offset < singleFile.size) {
-            console.warn(`[Gemini Chunked] ⚠️  Se alcanzó el tope de ${MAX_BINARY_CHUNKS} fragmentos: el resto del audio no se transcribe`);
-            progress.pushEvent('warn', m(
-                `El audio es tan largo que se corta en el fragmento ${MAX_BINARY_CHUNKS}`,
-                `The audio is so long it is cut at chunk ${MAX_BINARY_CHUNKS}`,
-            ));
-        }
+    if (isPreChunked) {
+        console.log(`[Gemini Chunked] Using ${chunks.length} pre-existing temporal chunks`);
     }
 
     console.log(`[Gemini Chunked] Ready to transcribe ${chunks.length} chunks`);
@@ -1527,7 +1377,8 @@ export async function transcribeWithGeminiChunked(
                 index: chunk.index,
                 text: result.text,
                 tokens: result.tokensUsed,
-                offsetMinutes: Math.floor(chunk.start / 60)
+                startSec: chunk.start,
+                endSec: chunk.end,
             };
         } catch (e: any) {
             if (isCancelledError(e)) throw e;
@@ -1539,13 +1390,14 @@ export async function transcribeWithGeminiChunked(
                 `Chunk ${chunk.index + 1}: ${e?.message || 'could not be transcribed'}`,
             ), { chunk: chunk.index });
             updateProgress();
-            const startLabel = secondsToLabel(chunk.start);
-            const endLabel = secondsToLabel(chunk.end);
+            const startLabel = plainLabel(chunk.start);
+            const endLabel = plainLabel(chunk.end);
             return {
                 index: chunk.index,
                 text: `[⚠️ Falta el audio de ${startLabel} a ${endLabel}: ${e?.message || 'Error al transcribir fragmento'}]`,
                 tokens: 0,
-                offsetMinutes: Math.floor(chunk.start / 60)
+                startSec: chunk.start,
+                endSec: chunk.end,
             };
         }
     };
@@ -1571,22 +1423,11 @@ export async function transcribeWithGeminiChunked(
         throw new Error(firstError || 'Todos los fragmentos fallaron al transcribir.');
     }
 
-    // 3. Post-procesamiento: Ajustar timestamps y eliminar duplicación
-    console.log('[Gemini Chunked] 🔧 Post-processing...');
-    console.log('[Gemini Chunked]   • Adjusting timestamps');
-    console.log('[Gemini Chunked]   • Detecting overlap');
-    console.log('[Gemini Chunked]   • Removing duplication');
+    // 3. Coser: tiempos absolutos y solape fuera, ambos por el segundo de inicio.
+    console.log('[Gemini Chunked] 🔧 Stitching chunks (absolute timestamps + overlap)');
 
     results.sort((a, b) => a.index - b.index);
-
-    // Ajustar timestamps de cada chunk
-    const chunksWithAdjustedTimestamps = results.map(r => ({
-        ...r,
-        text: r.text.startsWith('[⚠️ Falta el audio') ? r.text : adjustTimestamps(r.text, r.offsetMinutes)
-    }));
-
-    // Detectar y eliminar duplicación entre chunks
-    const cleanedText = detectAndRemoveOverlap(chunksWithAdjustedTimestamps);
+    const cleanedText = stitchChunks(results);
 
     const totalTokens = results.reduce((sum, r) => sum + r.tokens, 0);
 

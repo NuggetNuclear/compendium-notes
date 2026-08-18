@@ -29,22 +29,29 @@ describe('duraciones que el navegador no sabe medir', () => {
     });
 });
 
-describe('troceado binario con duración inservible', () => {
+/**
+ * Un archivo que llega SIN trocear por tiempo.
+ *
+ * Aquí había un troceado por bytes que se inventaba los fragmentos, y estas
+ * pruebas vigilaban su peor efecto: con una duración de Infinity salía a 0 bytes
+ * por fragmento, `offset += 0`, y la pestaña moría llenando memoria. Ese
+ * troceado ya no existe —cortar un MP3 o un WAV por bytes no produce audio, sólo
+ * el primer trozo era válido—, así que lo que se vigila ahora es que la entrada
+ * rara siga terminando: una petición, con el audio entero, y un aviso.
+ */
+describe('audio sin trocear por tiempo', () => {
     afterEach(() => vi.unstubAllGlobals());
     beforeEach(() => progress.resetIdle());
 
     /** 50 MB de MP3: un archivo grande y creíble, sin duración legible. */
     const bigFile = () => new File([new Uint8Array(50 * 1024 * 1024)], 'clase.mp3', { type: 'audio/mpeg' });
 
-    it('termina y trocea por tamaño cuando la duración llega como Infinity', async () => {
+    it('termina en una sola petición cuando la duración llega como Infinity', async () => {
         const ctx = installMocks(() => geminiStream(fakeTranscript(0, 600)));
 
-        // Antes esto era un bucle infinito: size / Infinity = 0 bytes por
-        // fragmento, `offset += 0`, y la pestaña moría llenando memoria.
         const r = await transcribeWithGeminiChunked(bigFile(), 'KEY', undefined, Infinity);
 
-        expect(ctx.calls.length).toBeGreaterThan(0);
-        expect(ctx.calls.length).toBeLessThanOrEqual(60);
+        expect(ctx.calls).toHaveLength(1);
         expect(r.text.length).toBeGreaterThan(0);
     }, 30_000);
 
@@ -52,16 +59,16 @@ describe('troceado binario con duración inservible', () => {
         const ctx = installMocks(() => geminiStream(fakeTranscript(0, 600)));
         const r = await transcribeWithGeminiChunked(bigFile(), 'KEY', undefined, 0);
 
-        expect(ctx.calls.length).toBeGreaterThan(0);
+        expect(ctx.calls).toHaveLength(1);
         expect(r.text.length).toBeGreaterThan(0);
     }, 30_000);
 
-    it('avisa en el registro de que los tiempos serán aproximados', async () => {
+    it('avisa de que el audio va entero y puede quedarse corto', async () => {
         installMocks(() => geminiStream(fakeTranscript(0, 600)));
         await transcribeWithGeminiChunked(bigFile(), 'KEY', undefined, Infinity);
 
         const avisos = progress.getSnapshot().events.filter(e => e.kind === 'warn');
-        expect(avisos.some(e => /duración|duration/i.test(e.text))).toBe(true);
+        expect(avisos.some(e => /trocear|split/i.test(e.text))).toBe(true);
     }, 30_000);
 });
 

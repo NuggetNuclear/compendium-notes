@@ -418,36 +418,6 @@ export async function extractAudioTrack(
 }
 
 /**
- * Verificar si un formato necesita chunking temporal (no soporta chunking binario)
- */
-export function needsTemporalChunking(fileName: string, mimeType: string): boolean {
-    // Formatos contenedor (necesitan chunking temporal)
-    const containerFormats = [
-        'm4a', 'mp4', 'mov',           // MPEG-4 contenedor
-        'webm', 'mkv',                 // WebM/Matroska
-        'ogg', 'opus',                 // Ogg contenedor
-        'flac',                        // FLAC tiene headers complejos
-    ];
-
-    const extension = fileName.match(/\.([^.]+)$/)?.[1]?.toLowerCase();
-
-    if (extension && containerFormats.includes(extension)) {
-        return true;
-    }
-
-    // Verificar por MIME type
-    const containerMimes = [
-        'audio/mp4', 'audio/x-m4a', 'audio/m4a',
-        'video/mp4', 'video/quicktime',
-        'audio/webm', 'video/webm',
-        'audio/ogg', 'audio/opus',
-        'audio/flac', 'audio/x-flac',
-    ];
-
-    return containerMimes.includes(mimeType);
-}
-
-/**
  * Validar si FFmpeg.wasm está disponible en el navegador
  */
 export function isFFmpegSupported(): boolean {

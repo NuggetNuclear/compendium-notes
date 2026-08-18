@@ -1,5 +1,5 @@
 import { Mp3Encoder } from '@breezystack/lamejs';
-import { chunkFileTemporally, needsTemporalChunking, isFFmpegSupported, extractAudioTrack, probeDuration } from './ffmpeg-chunker';
+import { chunkFileTemporally, isFFmpegSupported, extractAudioTrack, probeDuration } from './ffmpeg-chunker';
 import { sanitizeDuration } from './duration';
 import { CHUNK_SIZE_MINUTES as GEMINI_CHUNK_MINUTES, CHUNK_OVERLAP_SECONDS as GEMINI_CHUNK_OVERLAP } from './gemini';
 
@@ -241,73 +241,61 @@ async function processForGemini(
             };
         }
 
-        // ✅ CASO 2: Audio largo con formato contenedor
-        if (needsTemporalChunking(file.name, file.type)) {
-            // Verificar soporte de FFmpeg
-            if (!isFFmpegSupported()) {
-                console.warn('[AudioProcessor] ⚠️ FFmpeg not supported, falling back to MP3 conversion');
-                return await fallbackToMP3Conversion(file, duration, onProgress);
-            }
-
-            console.log(`[AudioProcessor] 🎯 Long container format detected (>=${CHUNKING_THRESHOLD_MINUTES}min)`);
-            console.log('[AudioProcessor] 🔧 Using FFmpeg temporal chunking (NO re-encoding)');
-            console.log('[AudioProcessor] Target: Preserve original format with valid chunks');
-
-            try {
-                onProgress?.('chunking', 0);
-
-                const result = await chunkFileTemporally(
-                    file,
-                    duration, // Pasar duración desde Web Audio API
-                    CHUNKING_THRESHOLD_MINUTES,
-                    GEMINI_CHUNK_OVERLAP,
-                    (stage, p) => onProgress?.('chunking', p)
-                );
-
-                console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-                console.log('[AudioProcessor] ✅ FFmpeg Temporal Chunking Complete');
-                console.log(`[AudioProcessor] Created ${result.chunks.length} chunks`);
-                console.log(`[AudioProcessor] Format: ${result.format} (preserved)`);
-                console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
-                return {
-                    chunks: result.chunks.map(c => c.file),
-                    originalSize: file.size,
-                    compressedSize: result.chunks.reduce((sum, c) => sum + c.file.size, 0),
-                    wasCompressed: false, // No recodificamos
-                    wasChunked: true,
-                    chunkingMethod: 'temporal-ffmpeg',
-                    duration: result.totalDuration,
-                    chunkMetadata: result.chunks.map(c => ({
-                        startTime: c.startTime,
-                        endTime: c.endTime,
-                        index: c.index
-                    }))
-                };
-
-            } catch (e) {
-                console.error('[AudioProcessor] FFmpeg chunking failed:', e);
-                console.warn('[AudioProcessor] Falling back to MP3 conversion...');
-                return await fallbackToMP3Conversion(file, duration, onProgress);
-            }
+        // ✅ CASO 2: audio largo — SIEMPRE troceado por tiempo con FFmpeg.
+        //
+        // Aquí había una excepción para MP3/WAV que los dejaba pasar enteros
+        // para que la capa de Gemini los cortara por bytes. Cortar por bytes
+        // sólo produce un fragmento válido: el primero. Los demás salen sin
+        // cabecera —un WAV sin su RIFF no es un archivo de audio, y un MP3
+        // empieza a mitad de trama— y se subían igual. De ahí venían los
+        // "fragmento X falló" y las transcripciones que no se parecían al
+        // audio. Cortar por tiempo es lo único que da fragmentos que se pueden
+        // reproducir, y FFmpeg lo hace con `-c copy`, sin recodificar nada.
+        if (!isFFmpegSupported()) {
+            console.warn('[AudioProcessor] ⚠️ FFmpeg not supported, falling back to MP3 conversion');
+            return await fallbackToMP3Conversion(file, duration, onProgress);
         }
 
-        // ✅ CASO 3: Audio largo MP3/WAV - Paso directo
-        // El chunking binario se hará en gemini.ts
-        console.log('[AudioProcessor] ✅ Long MP3/WAV file: Direct Pass');
-        console.log('[AudioProcessor] Strategy: Binary chunking in Gemini layer');
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        return {
-            chunks: [file],
-            originalSize: file.size,
-            compressedSize: file.size,
-            wasCompressed: false,
-            wasChunked: false,
-            chunkingMethod: 'none', // Se chunkeará binariamente después
-            duration,
-        };
+        console.log(`[AudioProcessor] 🎯 Long audio detected (>=${CHUNKING_THRESHOLD_MINUTES}min)`);
+        console.log('[AudioProcessor] 🔧 Using FFmpeg temporal chunking (NO re-encoding)');
 
+        try {
+            onProgress?.('chunking', 0);
 
+            const result = await chunkFileTemporally(
+                file,
+                duration, // Pasar duración desde Web Audio API
+                CHUNKING_THRESHOLD_MINUTES,
+                GEMINI_CHUNK_OVERLAP,
+                (stage, p) => onProgress?.('chunking', p)
+            );
+
+            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+            console.log('[AudioProcessor] ✅ FFmpeg Temporal Chunking Complete');
+            console.log(`[AudioProcessor] Created ${result.chunks.length} chunks`);
+            console.log(`[AudioProcessor] Format: ${result.format} (preserved)`);
+            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+            return {
+                chunks: result.chunks.map(c => c.file),
+                originalSize: file.size,
+                compressedSize: result.chunks.reduce((sum, c) => sum + c.file.size, 0),
+                wasCompressed: false, // No recodificamos
+                wasChunked: true,
+                chunkingMethod: 'temporal-ffmpeg',
+                duration: result.totalDuration,
+                chunkMetadata: result.chunks.map(c => ({
+                    startTime: c.startTime,
+                    endTime: c.endTime,
+                    index: c.index
+                }))
+            };
+
+        } catch (e) {
+            console.error('[AudioProcessor] FFmpeg chunking failed:', e);
+            console.warn('[AudioProcessor] Falling back to MP3 conversion...');
+            return await fallbackToMP3Conversion(file, duration, onProgress);
+        }
     }
 
     // VIDEO: Extraer audio en alta calidad

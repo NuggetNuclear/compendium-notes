@@ -79,7 +79,8 @@ describe('transcripción estándar (sin fragmentar)', () => {
             installMocks(() => geminiStream(fakeTranscript(0, 600), { finishReason: 'MAX_TOKENS' }));
             const r = await transcribeWithGemini(audioFile(), 'KEY', undefined, 1200);
 
-            expect(r.text).toContain('Falta el audio a partir de [09:30]');
+            // Sin corchetes: ver la nota del mismo aviso en transcribe-chunked.
+            expect(r.text).toContain('Falta el audio a partir de 09:30');
             expect(r.text).toContain('límite de tokens');
         });
 

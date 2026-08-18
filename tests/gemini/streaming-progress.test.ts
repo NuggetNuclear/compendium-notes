@@ -118,20 +118,23 @@ describe('tamaño de fragmento', () => {
         expect(CHUNK_OVERLAP_SECONDS).toBeLessThan(CHUNK_SIZE_MINUTES * 60 * 0.1);
     });
 
-    it('un audio de media hora sin trocear se parte en unos seis fragmentos', async () => {
+    /**
+     * El troceado lo hace FFmpeg antes de llegar aquí, cortando por TIEMPO.
+     * Esta capa ya no corta nada por su cuenta: un archivo que llega entero se
+     * transcribe entero. Antes lo partía por bytes, y todos los trozos menos el
+     * primero salían sin cabecera — es decir, no eran audio.
+     */
+    it('un audio que llega entero se transcribe entero, sin inventar cortes', async () => {
         const media = 30 * 60;
         const archivo = audioFile('clase.mp3', 30 * 1024 * 1024);
-        installMocks(() => sse(fakeTranscript(0, 600)));
+        const ctx = installMocks(() => sse(fakeTranscript(0, 600)));
 
         await transcribeWithGeminiChunked(archivo, 'KEY', undefined, media, undefined, undefined, 2);
 
+        expect(ctx.calls).toHaveLength(1);
         const chunks = progress.getSnapshot().chunks;
-        expect(chunks.length).toBeGreaterThanOrEqual(3);
-        expect(chunks.length).toBeLessThanOrEqual(7);
-        // Cada uno cubre unos diez minutos de grabación.
-        const span = chunks[0].endSec - chunks[0].startSec;
-        expect(span).toBeGreaterThan(9 * 60);
-        expect(span).toBeLessThan(12 * 60);
+        expect(chunks).toHaveLength(1);
+        expect(chunks[0].endSec - chunks[0].startSec).toBe(media);
     });
 });
 

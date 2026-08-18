@@ -128,6 +128,22 @@ export default function NotesEditor() {
         return file?.name?.replace(/\.[^.]+$/, '') || 'Untitled Note';
     }, [title, editedNotes, file]);
 
+    /**
+     * El cuerpo sin su título.
+     *
+     * El título va aparte —en la cabecera del PDF y arriba de la vista previa—,
+     * así que si la primera línea es ese mismo título hay que quitarla o sale
+     * dos veces. Estaba escrito tres veces, y las tres arrastraban además un
+     * `## Título` del formato antiguo de Groq que el prompt compartido ya no
+     * produce.
+     */
+    const stripLeadingTitle = (text: string) => {
+        const firstLine = text.match(/^\s*#{1,2}\s+([^\n]+)/);
+        return firstLine && firstLine[1].trim().replace(/\*\*/g, '') === derivedTitle
+            ? text.replace(/^\s*#{1,2}\s+[^\n]+\n*/, '').trim()
+            : text.trim();
+    };
+
     const handleCopy = async () => {
         await navigator.clipboard.writeText(showTranscript ? transcription : editedNotes);
         setCopied(true);
@@ -139,20 +155,7 @@ export default function NotesEditor() {
         try {
             let finalContent = showTranscript ? transcription : editedNotes;
 
-            if (!title && !showTranscript) {
-                let cleaned = finalContent.replace(/^## T[íi]tulo\s*\n+[^\n]+\n*/m, '');
-
-                if (cleaned === finalContent) {
-                    const firstLineMatch = finalContent.match(/^\s*#{1,2}\s+([^\n]+)/);
-                    if (firstLineMatch) {
-                        const candidate = firstLineMatch[1].trim();
-                        if (candidate.replace(/\*\*/g, '') === derivedTitle) {
-                            cleaned = finalContent.replace(/^\s*#{1,2}\s+[^\n]+\n*/, '');
-                        }
-                    }
-                }
-                finalContent = cleaned.trim();
-            }
+            if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
 
             await generatePdf({
                 title: derivedTitle,
@@ -301,15 +304,7 @@ export default function NotesEditor() {
     const previewHtml = useMemo(() => {
         const styles = previewStyles;
 
-        // Remover título del contenido
-        let contentToRender = editedNotes.replace(/^## T[íi]tulo\s*\n+[^\n]+\n*/m, '').trim();
-
-        if (contentToRender === editedNotes.trim()) {
-            const firstLineMatch = editedNotes.match(/^\s*#{1,2}\s+([^\n]+)/);
-            if (firstLineMatch && firstLineMatch[1].trim().replace(/\*\*/g, '') === derivedTitle) {
-                contentToRender = editedNotes.replace(/^\s*#{1,2}\s+[^\n]+\n*/, '').trim();
-            }
-        }
+        const contentToRender = stripLeadingTitle(editedNotes);
 
         const lines = contentToRender.split('\n');
         let processedHtml = '';
@@ -652,15 +647,7 @@ export default function NotesEditor() {
                     <button
                         onClick={async () => {
                             let finalContent = showTranscript ? transcription : editedNotes;
-                            if (!title && !showTranscript) {
-                                finalContent = finalContent.replace(/^## T[íi]tulo\s*\n+[^\n]+\n*/m, '').trim();
-                                if (finalContent === editedNotes.trim()) {
-                                    const firstLineMatch = editedNotes.match(/^\s*#{1,2}\s+([^\n]+)/);
-                                    if (firstLineMatch && firstLineMatch[1].trim().replace(/\*\*/g, '') === derivedTitle) {
-                                        finalContent = editedNotes.replace(/^\s*#{1,2}\s+[^\n]+\n*/, '').trim();
-                                    }
-                                }
-                            }
+                            if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
                             const url = await generatePdf({
                                 title: derivedTitle,
                                 date: new Date().toLocaleDateString(locale === 'es' ? 'es-CL' : 'en-US'),

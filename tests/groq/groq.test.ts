@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { transcribeAudio, organizeNotes, validateGroqKey, GROQ_MODEL_CHAIN, GROQ_WHISPER_MODEL } from '../../src/lib/groq';
 import { progress } from '../../src/lib/progress';
-import { installMocks, groqStream, apiError, audioFile, repetitionLoop } from '../helpers/mock-gemini';
+import {
+    installMocks, groqStream, apiError, audioFile, repetitionLoop,
+    mockAudioSlicing, restoreAudioSlicing,
+} from '../helpers/mock-gemini';
 
 /** Respuesta de Whisper en el formato verbose_json que pide la app. */
 const whisper = (segments: Array<[number, string]>) =>
@@ -23,7 +26,10 @@ Contenido desarrollado de la sección.
 
 describe('Groq · transcripción con Whisper', () => {
     beforeEach(() => progress.resetIdle());
-    afterEach(() => vi.unstubAllGlobals());
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        restoreAudioSlicing();
+    });
 
     it('convierte los segmentos en texto con timestamps', async () => {
         installMocks(() => whisper([[0, 'Hola a todos'], [65, 'Segunda parte']]));
@@ -57,6 +63,35 @@ describe('Groq · transcripción con Whisper', () => {
 
         expect(texto).not.toMatch(/no, no, no, no, no, no/);
         expect(texto).toContain('Contenido normal');
+    });
+
+    it('reintenta sólo el tramo en que Whisper se queda pegado', async () => {
+        // Whisper se atasca en el minuto 9:48 de un fragmento de 20 minutos:
+        // los diez que quedaban detrás se recuperan con una segunda petición
+        // sobre el recorte, no repitiendo el fragmento entero.
+        const { slices } = mockAudioSlicing();
+        let n = 0;
+        installMocks(() => ++n === 1
+            ? whisper([[0, 'Contenido normal'], [588, 'no, '.repeat(200)]])
+            : whisper([[0, 'lo que venía después']]));
+
+        const texto = await transcribeAudio([audioFile()], 'KEY', undefined, [1200]);
+
+        expect(slices).toEqual([{ startSec: 588, endSec: 1200 }]);
+        expect(texto).toContain('Contenido normal');
+        expect(texto).toContain('[09:48] lo que venía después');
+        expect(texto).not.toMatch(/no, no, no, no/);
+    });
+
+    it('señala el hueco si el tramo atascado no se puede recuperar', async () => {
+        // Sin FFmpeg no hay recorte posible: el documento lo dice en lugar de
+        // terminar antes de tiempo aparentando estar completo.
+        installMocks(() => whisper([[0, 'Contenido normal'], [588, 'no, '.repeat(200)]]));
+
+        const texto = await transcribeAudio([audioFile()], 'KEY', undefined, [1200]);
+
+        expect(texto).toContain('Contenido normal');
+        expect(texto).toContain('falta el audio de 09:48 a 20:00');
     });
 
     it('usa el campo text si no hay segmentos', async () => {

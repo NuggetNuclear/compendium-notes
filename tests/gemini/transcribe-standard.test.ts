@@ -67,12 +67,15 @@ describe('transcripción estándar (sin fragmentar)', () => {
     });
 
     describe('transcripción incorrecta o incompleta', () => {
-        it('limpia cuando el modelo entra en bucle de repetición', async () => {
+        it('descarta el tramo en que el modelo entra en bucle de repetición', async () => {
+            // El bucle ya no se "limpia" dejándolo a la vista: el segmento que
+            // estropea se descarta y se vuelve a pedir su audio. Lo que se
+            // rescata de ahí en adelante se prueba en `loop-recovery.test.ts`.
             installMocks(() => geminiStream(fakeTranscript(0, 300) + repetitionLoop(400)));
             const r = await transcribeWithGemini(audioFile(), 'KEY', undefined, 600);
 
             expect(r.text).not.toMatch(/no, no, no, no, no, no/);
-            expect(r.text).toContain('repetición del modelo omitida');
+            expect(r.text).toContain('[04:30]');
         });
 
         it('marca el corte por límite de tokens indicando DÓNDE se quedó', async () => {

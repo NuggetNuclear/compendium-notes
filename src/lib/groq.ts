@@ -2,6 +2,7 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1';
 import { progress, m as msg } from './progress';
 import { forEachSSE } from './sse';
 import { stripRepetitionRuns, tailRepetitionRun, secondsToLabel } from './text-cleanup';
+import { transcribeWithLoopRecovery } from './loop-recovery';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
 
 /**
@@ -131,32 +132,24 @@ async function transcribeSingleFile(
         const data = await response.json();
         console.log('[Groq] Transcripción completada');
 
-        // Whisper también se atasca repitiendo un segmento cuando hay silencio
-        // o ruido; sin esto la repetición llega tal cual al documento.
-        const clean = (out: string) => {
-            const { text, removed } = stripRepetitionRuns(out);
-            if (removed > 0) {
-                console.warn(`[Groq] 🧹 Removed ${removed} chars of repetition`);
-                progress.pushEvent('warn', msg(
-                    'Se eliminó una repetición del transcriptor',
-                    'Removed a repetition loop from the transcript',
-                ), { chunk: chunkIndex });
-            }
-            return text;
-        };
-
+        // El texto sale de aquí SIN limpiar. Whisper también se atasca
+        // repitiendo un segmento cuando hay silencio o ruido, y quien decide
+        // qué hacer con esa racha es `transcribeWithLoopRecovery`: necesita
+        // verla entera para saber por qué segundo del audio volver a empezar.
+        // Tacharla aquí, como se hacía antes, borraba justo la pista que hacía
+        // falta para recuperar el audio que venía detrás.
         if (data.segments && data.segments.length > 0) {
-            return clean(data.segments
+            return data.segments
                 .map((seg: any) => {
                     const mins = Math.floor(seg.start / 60);
                     const secs = Math.floor(seg.start % 60);
                     const timestamp = `[${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}]`;
                     return `${timestamp} ${seg.text.trim()}`;
                 })
-                .join('\n'));
+                .join('\n');
         }
 
-        return clean(data.text || '');
+        return data.text || '';
     } catch (err: any) {
         // La cancelación del usuario no es un fallo del fragmento: sube tal cual.
         if (isCancelledError(err)) throw err;
@@ -262,61 +255,101 @@ export async function transcribeAudio(
         let usedModel = chain[0];
         let gastados = 0;
 
-        // Cada modelo de la cadena tiene sus reintentos; si se agotan y el
-        // error era pasajero, se prueba el siguiente antes de dar el fragmento
-        // por perdido.
-        modelos:
-        for (let mi = 0; mi < chain.length; mi++) {
-            const candidato = chain[mi];
-            usedModel = candidato;
+        /**
+         * Transcribe un audio concreto —el fragmento entero, o el recorte que
+         * sigue a un atasco— agotando la cadena de modelos y sus reintentos.
+         *
+         * Devuelve `null` si no hay nada que hacer con él.
+         */
+        const transcribirAudio = async (audio: File, segundos: number): Promise<string | null> => {
+            let salida: string | null = null;
 
-            for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
-                gastados++;
-                progress.setChunkMeta(i, { attempts: gastados, requests: gastados, model: candidato });
-                try {
-                    text = await transcribeSingleFile(chunks[i], apiKey, i, chunkSeconds?.[i], candidato);
-                    break modelos;
-                } catch (err: any) {
-                    if (isCancelledError(err)) throw err;
-                    lastError = err?.message || String(err);
-                    const retryable = err instanceof GroqError && err.retryable;
+            // Cada modelo de la cadena tiene sus reintentos; si se agotan y el
+            // error era pasajero, se prueba el siguiente antes de dar el fragmento
+            // por perdido.
+            modelos:
+            for (let mi = 0; mi < chain.length; mi++) {
+                const candidato = chain[mi];
+                usedModel = candidato;
 
-                    // Una key mala o un audio que no admite no mejoran con otro
-                    // modelo: se abandona el fragmento aquí.
-                    if (!retryable) {
-                        console.error(`[Groq] ❌ Fragmento ${i + 1}/${total}: ${lastError}`);
+                for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+                    gastados++;
+                    progress.setChunkMeta(i, { attempts: gastados, requests: gastados, model: candidato });
+                    try {
+                        salida = await transcribeSingleFile(audio, apiKey, i, segundos, candidato);
                         break modelos;
-                    }
+                    } catch (err: any) {
+                        if (isCancelledError(err)) throw err;
+                        lastError = err?.message || String(err);
+                        const retryable = err instanceof GroqError && err.retryable;
 
-                    if (attempt === MAX_CHUNK_ATTEMPTS) {
-                        const siguiente = chain[mi + 1];
-                        if (!siguiente) {
+                        // Una key mala o un audio que no admite no mejoran con otro
+                        // modelo: se abandona el fragmento aquí.
+                        if (!retryable) {
                             console.error(`[Groq] ❌ Fragmento ${i + 1}/${total}: ${lastError}`);
                             break modelos;
                         }
-                        if (!avisadoDelCambio) {
-                            avisadoDelCambio = true;
-                            progress.pushEvent('warn', msg(
-                                `${candidato} sigue fallando; se continúa con ${siguiente}`,
-                                `${candidato} keeps failing; continuing with ${siguiente}`,
-                            ));
-                        }
-                        console.warn(`[Groq] ⚠️  ${candidato} agotado → ${siguiente}`);
-                        break;
-                    }
 
-                    const waitMs = (err as GroqError).retryAfterMs || 5_000;
-                    console.warn(`[Groq] ⏳ Fragmento ${i + 1} falló (${lastError}), reintento en ${(waitMs / 1000).toFixed(0)}s`);
-                    progress.pushEvent('retry', msg(
-                        `Falló (${lastError}) — reintentando en ${Math.round(waitMs / 1000)}s`,
-                        `Failed (${lastError}) — retrying in ${Math.round(waitMs / 1000)}s`,
-                    ), { chunk: i });
-                    progress.beginWait(Date.now() + waitMs, msg('Reintentando fragmento', 'Retrying chunk'));
-                    await sleep(waitMs);
-                    progress.endWait();
+                        if (attempt === MAX_CHUNK_ATTEMPTS) {
+                            const siguiente = chain[mi + 1];
+                            if (!siguiente) {
+                                console.error(`[Groq] ❌ Fragmento ${i + 1}/${total}: ${lastError}`);
+                                break modelos;
+                            }
+                            if (!avisadoDelCambio) {
+                                avisadoDelCambio = true;
+                                progress.pushEvent('warn', msg(
+                                    `${candidato} sigue fallando; se continúa con ${siguiente}`,
+                                    `${candidato} keeps failing; continuing with ${siguiente}`,
+                                ));
+                            }
+                            console.warn(`[Groq] ⚠️  ${candidato} agotado → ${siguiente}`);
+                            break;
+                        }
+
+                        const waitMs = (err as GroqError).retryAfterMs || 5_000;
+                        console.warn(`[Groq] ⏳ Fragmento ${i + 1} falló (${lastError}), reintento en ${(waitMs / 1000).toFixed(0)}s`);
+                        progress.pushEvent('retry', msg(
+                            `Falló (${lastError}) — reintentando en ${Math.round(waitMs / 1000)}s`,
+                            `Failed (${lastError}) — retrying in ${Math.round(waitMs / 1000)}s`,
+                        ), { chunk: i });
+                        progress.beginWait(Date.now() + waitMs, msg('Reintentando fragmento', 'Retrying chunk'));
+                        await sleep(waitMs);
+                        progress.endWait();
+                    }
                 }
             }
+
+            return salida;
+        };
+
+        // Un modelo atascado repitiendo no pierde ya el resto del fragmento: se
+        // conserva lo transcrito antes del atasco y se vuelve a pedir SÓLO el
+        // audio que iba detrás. Whisper se engancha igual que Gemini —con
+        // silencios largos suelta "gracias por ver el video" en bucle—, y la
+        // única diferencia es que aquí la racha llega entera en la respuesta en
+        // vez de verse llegar por el stream.
+        const rescatado = await transcribeWithLoopRecovery({
+            file: chunks[i],
+            durationSec: chunkSeconds?.[i] ?? 0,
+            label: `Groq ${i + 1}/${total}`,
+            chunkIndex: i,
+            timeBaseSec: startsAt(i),
+            pass: async (audio, _offsetSec, remainingSec) => await transcribirAudio(audio, remainingSec) ?? '',
+        });
+        // Red de seguridad para las rachas que no dan para un rescate: cortas,
+        // o sin marca de tiempo delante que diga desde dónde reintentar.
+        const limpio = stripRepetitionRuns(rescatado.text);
+        if (limpio.removed > 0) {
+            console.warn(`[Groq] 🧹 Removed ${limpio.removed} chars of repetition`);
+            progress.pushEvent('warn', msg(
+                'Se eliminó una repetición del transcriptor',
+                'Removed a repetition loop from the transcript',
+            ), { chunk: i });
         }
+        // El fragmento sólo se da por perdido si NO se salvó ni una palabra:
+        // un rescate a medias sigue siendo audio transcrito.
+        text = limpio.text.trim() ? limpio.text : null;
 
         if (text !== null) {
             results.push(text);

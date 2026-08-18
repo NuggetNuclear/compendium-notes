@@ -271,6 +271,30 @@ export function repetitionLoop(repeats = 400): string {
     return `[09:48] Dicen, están caminando, ${'no, '.repeat(repeats)}`;
 }
 
+/**
+ * Doble del recorte con FFmpeg, que en jsdom no existe (no hay
+ * `SharedArrayBuffer` ni WASM que valga).
+ *
+ * Devuelve el registro de recortes pedidos: es lo que permite afirmar que un
+ * rescate vuelve a pedir SÓLO el tramo estropeado y desde qué segundo.
+ */
+export function mockAudioSlicing(): { slices: { startSec: number; endSec?: number }[] } {
+    const slices: { startSec: number; endSec?: number }[] = [];
+    vi.doMock('../../src/lib/ffmpeg-chunker', () => ({
+        isFFmpegSupported: () => true,
+        sliceAudio: async (file: File, startSec: number, endSec?: number) => {
+            slices.push({ startSec, endSec });
+            return new File([new Uint8Array(500)], `${file.name}_from${Math.round(startSec)}s.m4a`, { type: 'audio/mp4' });
+        },
+    }));
+    return { slices };
+}
+
+/** Deshace `mockAudioSlicing`: sin FFmpeg no hay rescate posible. */
+export function restoreAudioSlicing() {
+    vi.doUnmock('../../src/lib/ffmpeg-chunker');
+}
+
 export const audioFile = (name = 'clase.m4a', bytes = 1000) =>
     new File([new Uint8Array(bytes)], name, { type: 'audio/mp4' });
 

@@ -4,7 +4,8 @@ import { stripRepetitionRuns } from '../../src/lib/text-cleanup';
 import { progress } from '../../src/lib/progress';
 import {
     installMocks, geminiStream, fakeTranscript, transcriptFor, repetitionLoop,
-    fourChunks, audioFile, overloaded, countGaps, type RecordedCall,
+    fourChunks, audioFile, overloaded, countGaps, mockAudioSlicing, restoreAudioSlicing,
+    type RecordedCall,
 } from '../helpers/mock-gemini';
 
 /**
@@ -17,7 +18,10 @@ describe('regresiones de fallos observados', () => {
     const run = () => transcribeWithGeminiChunked(files, 'KEY', undefined, duration, metadata);
 
     beforeEach(() => progress.resetIdle());
-    afterEach(() => vi.unstubAllGlobals());
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        restoreAudioSlicing();
+    });
 
     describe('PDF "errorNo": diez páginas de "no, no, no" y diez minutos perdidos', () => {
         /**
@@ -57,10 +61,29 @@ describe('regresiones de fallos observados', () => {
         });
 
         it('el hueco queda señalado con el minuto exacto', async () => {
+            // Sin FFmpeg (jsdom) no hay recorte que reintentar, así que el
+            // tramo perdido se dice: es lo que faltaba en aquel PDF, que
+            // terminaba sin más y parecía completo.
             installMocks(() => geminiStream(fakeTranscript(0, 588) + repetitionLoop(7000)));
             const r = await transcribeWithGemini(audioFile(), 'KEY', undefined, 1200);
 
-            expect(r.text).toContain('repetición del modelo omitida');
+            expect(r.text).toContain('falta el audio de 09:48 a 20:00');
+        });
+
+        it('los diez minutos perdidos se recuperan reintentando sólo ese tramo', async () => {
+            const { slices } = mockAudioSlicing();
+            let n = 0;
+            const ctx = installMocks(() => (++n === 1
+                ? geminiStream(fakeTranscript(0, 588) + repetitionLoop(7000))
+                : geminiStream(fakeTranscript(0, 612, 'cola'))));
+
+            const r = await transcribeWithGemini(audioFile(), 'KEY', undefined, 1200);
+
+            expect(slices).toEqual([{ startSec: 588, endSec: 1200 }]);
+            expect(ctx.calls).toHaveLength(2);
+            // Los minutos 10 a 20 que aquel documento no tenía.
+            expect(r.text).toContain('[19:48]');
+            expect(countGaps(r.text)).toBe(0);
         });
     });
 

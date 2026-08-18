@@ -323,6 +323,68 @@ export async function chunkFileTemporally(
 }
 
 /**
+ * Recorta un trozo de un audio ya existente, por tiempo.
+ *
+ * Lo pide la recuperación de bucles: cuando un modelo se queda atascado
+ * repitiendo, lo transcrito ANTES del atasco sirve, y lo único que hay que
+ * volver a pedir es el audio que va desde ese segundo hasta el final del
+ * fragmento. Esto lo corta.
+ *
+ * Es el mismo `-c copy` que usa el troceado: no se recodifica nada, así que un
+ * recorte cuesta milisegundos y no toca la calidad. El corte cae en el paquete
+ * más cercano —décimas de segundo— y eso da igual: el trozo se vuelve a
+ * transcribir entero desde su marca de tiempo.
+ *
+ * @param startSec Segundo del archivo original donde empieza el recorte.
+ * @param endSec   Segundo donde acaba. Sin él, hasta el final.
+ */
+export async function sliceAudio(file: File, startSec: number, endSec?: number): Promise<File> {
+    if (!(startSec >= 0)) throw new Error('sliceAudio: inicio inválido');
+
+    const ffmpeg = await loadFFmpeg();
+    const extension = getOutputExtension(file.type, file.name);
+    const reencode = needsReencoding(extension);
+    const outExtension = reencode ? 'm4a' : extension;
+    const outMime = reencode ? 'audio/mp4' : (file.type || 'audio/mp4');
+
+    const inputName = `slice_input.${extension}`;
+    const outputName = `slice_output.${outExtension}`;
+
+    try {
+        await ffmpeg.writeFile(inputName, await fetchFile(file));
+
+        const args = ['-i', inputName, '-ss', String(startSec)];
+        if (endSec !== undefined && endSec > startSec) args.push('-t', String(endSec - startSec));
+        args.push(...(reencode ? ['-c:a', 'aac', '-b:a', '128k'] : ['-c', 'copy']), '-y', outputName);
+
+        const exitCode = await withTimeout(
+            ffmpeg.exec(args),
+            EXEC_TIMEOUT_MS,
+            'FFmpeg tardó demasiado recortando el audio',
+        );
+        if (exitCode !== 0) throw new Error(`FFmpeg terminó con código ${exitCode} al recortar el audio`);
+
+        const data = await ffmpeg.readFile(outputName) as Uint8Array;
+        // Copia a un ArrayBuffer normal: lo que devuelve FFmpeg vive en un
+        // SharedArrayBuffer y `Blob` no siempre lo acepta.
+        const copy = new Uint8Array(data.length);
+        copy.set(data);
+
+        const base = file.name.replace(/\.[^.]+$/, '');
+        const outFile = new File(
+            [new Blob([copy], { type: outMime })],
+            `${base}_from${Math.round(startSec)}s.${outExtension}`,
+            { type: outMime },
+        );
+        if (outFile.size === 0) throw new Error('El recorte salió vacío');
+        return outFile;
+    } finally {
+        await ffmpeg.deleteFile(inputName).catch(() => { /* puede no haberse escrito */ });
+        await ffmpeg.deleteFile(outputName).catch(() => { /* puede no haberse creado */ });
+    }
+}
+
+/**
  * Lee la duración de un archivo sin decodificarlo entero.
  *
  * Es el último recurso cuando ni el elemento `<audio>` ni `decodeAudioData`

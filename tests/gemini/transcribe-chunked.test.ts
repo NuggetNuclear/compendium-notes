@@ -3,7 +3,8 @@ import { transcribeWithGeminiChunked, MAX_RETRIES_PER_MODEL, maxParallelChunks }
 import { progress } from '../../src/lib/progress';
 import {
     installMocks, geminiStream, fakeTranscript, repetitionLoop, fourChunks,
-    overloaded, badRequest, dailyQuota, countGaps, type RecordedCall,
+    overloaded, badRequest, dailyQuota, countGaps, mockAudioSlicing, restoreAudioSlicing,
+    type RecordedCall,
 } from '../helpers/mock-gemini';
 
 /**
@@ -17,7 +18,10 @@ describe('transcripción por fragmentos', () => {
     const startPoint = (c: RecordedCall) => c.prompt.match(/exactly at \[([\d:]+)\]/)?.[1] ?? null;
 
     beforeEach(() => progress.resetIdle());
-    afterEach(() => vi.unstubAllGlobals());
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        restoreAudioSlicing();
+    });
 
     describe('camino feliz', () => {
         it('una petición por fragmento y el texto ensamblado en orden', async () => {
@@ -143,18 +147,35 @@ describe('transcripción por fragmentos', () => {
             expect(pico).toBeLessThanOrEqual(maxParallelChunks('gemini-3.5-flash-lite', 1200));
         });
 
-        it('limpia los bucles de repetición dentro de un fragmento', async () => {
+        it('rescata el tramo que un fragmento pierde por un bucle de repetición', async () => {
+            const { slices } = mockAudioSlicing();
             installMocks((c, x) => {
+                // Sólo el fragmento 1 se atasca, y sólo la primera vez.
                 if (c.uris.includes(x.uriOf(0))) {
-                    return geminiStream(fakeTranscript(0, 580) + repetitionLoop(400));
+                    return geminiStream(fakeTranscript(0, 588) + repetitionLoop(400));
                 }
-                return geminiStream(fakeTranscript(0, 1200));
+                return geminiStream(fakeTranscript(0, 1200, c.uris[0]));
             });
 
             const r = await run();
 
+            expect(slices).toEqual([{ startSec: 588, endSec: 1200 }]);
             expect(r.text).not.toMatch(/no, no, no, no, no, no/);
-            expect(r.text).toContain('repetición del modelo omitida');
+            // El rescate se cose dentro del fragmento, no como un hueco.
+            expect(countGaps(r.text)).toBe(0);
+            expect(r.text).toContain('[09:48]');
+        });
+
+        it('un fragmento atascado sin rescate posible no arrastra a los demás', async () => {
+            installMocks((c, x) => c.uris.includes(x.uriOf(0))
+                ? geminiStream(fakeTranscript(0, 588) + repetitionLoop(400))
+                : geminiStream(fakeTranscript(0, 1200, c.uris[0])));
+
+            const r = await run();
+
+            expect(countGaps(r.text)).toBe(1);
+            expect(r.text).toContain('falta el audio de 09:48 a 20:00');
+            expect(r.text).toContain('[40:00]');
         });
     });
 });

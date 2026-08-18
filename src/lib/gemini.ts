@@ -4,6 +4,7 @@ const GEMINI_UPLOAD_URL = 'https://generativelanguage.googleapis.com/upload/v1be
 import { getLanguageNameEn } from './languages';
 import { progress, m } from './progress';
 import { stripRepetitionRuns, lastTimestampSeconds, secondsToLabel, tailRepetitionRun } from './text-cleanup';
+import { transcribeWithLoopRecovery } from './loop-recovery';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
 import { sanitizeDuration } from './duration';
 import { forEachSSE } from './sse';
@@ -1011,148 +1012,206 @@ export async function transcribeWithGemini(
 
     const startTime = Date.now();
 
-    // Upload, con un segundo intento.
-    //
-    // La subida iba a pelo: un corte de red de un segundo en mitad de los 20 MB
-    // de un fragmento lo daba por perdido y dejaba un hueco en la transcripción
-    // que un simple reintento habría evitado.
-    let fileUri = '';
-    for (let attempt = 0; attempt < MAX_UPLOAD_ATTEMPTS; attempt++) {
-        throwIfCancelled();
-        try {
-            fileUri = await uploadToGemini(file, apiKey, (p) => {
-                onProgress?.(p * 0.5);
-                // Dentro de un fragmento, la subida es el primer 15% del trabajo.
-                chunk?.onProgress?.(p * 0.3);
-            });
-            break;
-        } catch (e: any) {
-            if (isCancelledError(e)) throw e;
-            if (attempt >= MAX_UPLOAD_ATTEMPTS - 1) throw e;
-            const waitMs = backoffMs(attempt);
-            console.warn(`[${tag}] ⚠️  Subida fallida (${e?.message || e}); reintento en ${(waitMs / 1000).toFixed(0)}s`);
-            progress.pushEvent('retry', m(
-                `Falló la subida del audio — reintentando en ${Math.round(waitMs / 1000)}s`,
-                `Audio upload failed — retrying in ${Math.round(waitMs / 1000)}s`,
-            ), { chunk: chunk?.index });
-            progress.beginWait(Date.now() + waitMs, m('Reintentando la subida', 'Retrying the upload'));
-            await sleep(waitMs);
-            progress.endWait();
-        }
-    }
-    onProgress?.(0.5);
-    chunk?.onProgress?.(0.15);
-
-    // Normalizar MIME type (Gemini puede rechazar audio/x-m4a)
-    let mimeType = file.type || 'audio/mpeg';
-    if (mimeType === 'audio/x-m4a') mimeType = 'audio/mp4';
-    if (mimeType === 'audio/x-wav') mimeType = 'audio/wav';
-
     const isFixed = Boolean(model && model !== 'auto');
     const models = chainStartingWith(model, TRANSCRIPTION_FALLBACK_MODELS);
-    // Con modelo elegido siempre se arranca por él; el índice compartido sólo
-    // tiene sentido cuando la cadena es la de siempre.
-    const startIdx = isFixed ? 0 : startModelIndex;
-    const maxTokens = outputTokenBudget(durationSeconds, TRANSCRIPTION_MAX_OUTPUT_TOKENS);
-    const prompt = transcriptionPrompt(chunk);
 
+    /** Lo que se acumula a lo largo de las pasadas (la primera y los rescates). */
     let requests = 0;
-    /** Próxima longitud a la que toca comprobar si el modelo se ha atascado. */
-    let loopCheckAt = 3000;
+    let tokensTotal = 0;
+    let modelIndex = isFixed ? 0 : startModelIndex;
+    let modelUsed = models[Math.min(modelIndex, models.length - 1)];
+    let lastFinishReason: string | null = null;
 
-    // Transcribir con fallback automático de modelos, publicando el avance
-    // según llega el texto.
-    const { text, finishReason, tokensUsed, modelUsed, modelIndex } = await geminiGenerateWithFallback(
-        models,
-        apiKey,
-        (_model) => ({
-            contents: [{
-                parts: [
-                    { fileData: { mimeType: mimeType, fileUri } },
-                    { text: prompt }
-                ]
-            }],
-            generationConfig: {
-                temperature: 0.1,
-                maxOutputTokens: maxTokens,
-            },
-            safetySettings: [
-                { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-                { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-            ],
-        }),
-        tag,
-        startIdx,
-        {
-            preferredModel: isFixed ? model : undefined,
-            onAttempt: (activeModel, attempt) => {
-                requests++;
-                if (chunk) {
-                    progress.setChunkMeta(chunk.index, { model: activeModel, attempts: attempt, requests });
-                } else {
-                    progress.setModel(activeModel, { n: attempt, max: MAX_RETRIES_PER_MODEL });
-                }
-            },
-            onDelta: (acc) => {
-                const p = progressFromTimestamps(acc, durationSeconds);
-                // El texto que llega es el 85% restante del trabajo del fragmento.
-                chunk?.onProgress?.(0.15 + p * 0.85);
-                onProgress?.(0.5 + p * 0.45);
-                if (!chunk) progress.setStreamCounters(acc.length);
+    /**
+     * Una pasada completa sobre un audio: subirlo y transcribirlo.
+     *
+     * Se llama una vez con el fragmento entero y, si el modelo se atasca
+     * repitiendo, otra vez con el recorte que va desde el atasco hasta el final.
+     * `offsetSec` es lo que ese recorte lleva de retraso respecto al fragmento:
+     * sirve para situar el progreso y para decirle al modelo de qué tramo del
+     * audio le estamos hablando.
+     */
+    const runPass = async (passFile: File, offsetSec: number, remainingSec: number): Promise<string> => {
+        const passDuration = remainingSec > 0 ? remainingSec : Math.max(1, durationSeconds - offsetSec);
+        const isRetry = offsetSec > 0;
+        const passTag = isRetry ? `${tag} +${Math.round(offsetSec)}s` : tag;
 
-                // Un modelo atascado ("no, no, no…") no se desatasca solo: se
-                // queda repitiendo hasta agotar el presupuesto de tokens. Antes
-                // había que pagar la respuesta entera y limpiarla después;
-                // ahora se corta en cuanto se ve, y lo transcrito hasta ahí se
-                // conserva.
-                if (acc.length >= loopCheckAt) {
-                    loopCheckAt = acc.length + 3000;
-                    if (tailRepetitionRun(acc)) {
-                        console.warn(`[${tag}] 🔁 Repetition loop detected — cutting the stream`);
-                        progress.pushEvent('warn', m(
-                            'El modelo se atascó repitiendo — se corta ahí',
-                            'The model got stuck repeating — cutting it short',
-                        ), { chunk: chunk?.index });
-                        return false;
+        // Upload, con un segundo intento.
+        //
+        // La subida iba a pelo: un corte de red de un segundo en mitad de los 20 MB
+        // de un fragmento lo daba por perdido y dejaba un hueco en la transcripción
+        // que un simple reintento habría evitado.
+        let fileUri = '';
+        for (let attempt = 0; attempt < MAX_UPLOAD_ATTEMPTS; attempt++) {
+            throwIfCancelled();
+            try {
+                fileUri = await uploadToGemini(passFile, apiKey, (p) => {
+                    if (isRetry) return;   // el rescate no vuelve a mover la barra hacia atrás
+                    onProgress?.(p * 0.5);
+                    // Dentro de un fragmento, la subida es el primer 15% del trabajo.
+                    chunk?.onProgress?.(p * 0.3);
+                });
+                break;
+            } catch (e: any) {
+                if (isCancelledError(e)) throw e;
+                if (attempt >= MAX_UPLOAD_ATTEMPTS - 1) throw e;
+                const waitMs = backoffMs(attempt);
+                console.warn(`[${passTag}] ⚠️  Subida fallida (${e?.message || e}); reintento en ${(waitMs / 1000).toFixed(0)}s`);
+                progress.pushEvent('retry', m(
+                    `Falló la subida del audio — reintentando en ${Math.round(waitMs / 1000)}s`,
+                    `Audio upload failed — retrying in ${Math.round(waitMs / 1000)}s`,
+                ), { chunk: chunk?.index });
+                progress.beginWait(Date.now() + waitMs, m('Reintentando la subida', 'Retrying the upload'));
+                await sleep(waitMs);
+                progress.endWait();
+            }
+        }
+        if (!isRetry) {
+            onProgress?.(0.5);
+            chunk?.onProgress?.(0.15);
+        }
+
+        // Normalizar MIME type (Gemini puede rechazar audio/x-m4a)
+        let mimeType = passFile.type || 'audio/mpeg';
+        if (mimeType === 'audio/x-m4a') mimeType = 'audio/mp4';
+        if (mimeType === 'audio/x-wav') mimeType = 'audio/wav';
+
+        // Con modelo elegido siempre se arranca por él; el índice compartido sólo
+        // tiene sentido cuando la cadena es la de siempre. Un rescate sigue por
+        // donde se quedó la pasada anterior: ya sabemos qué modelo responde.
+        const startIdx = isFixed ? 0 : modelIndex;
+        const maxTokens = outputTokenBudget(passDuration, TRANSCRIPTION_MAX_OUTPUT_TOKENS);
+        // El tramo que se le pide al modelo se desplaza con el recorte: es lo
+        // que hace que la parte 3 de 5 siga sabiendo dónde está tras un rescate.
+        const prompt = transcriptionPrompt(chunk && {
+            index: chunk.index,
+            total: chunk.total,
+            startSec: chunk.startSec + offsetSec,
+            endSec: chunk.startSec + offsetSec + passDuration,
+        });
+
+        /** Próxima longitud a la que toca comprobar si el modelo se ha atascado. */
+        let loopCheckAt = 3000;
+
+        // Transcribir con fallback automático de modelos, publicando el avance
+        // según llega el texto.
+        const out = await geminiGenerateWithFallback(
+            models,
+            apiKey,
+            (_model) => ({
+                contents: [{
+                    parts: [
+                        { fileData: { mimeType: mimeType, fileUri } },
+                        { text: prompt }
+                    ]
+                }],
+                generationConfig: {
+                    temperature: 0.1,
+                    maxOutputTokens: maxTokens,
+                },
+                safetySettings: [
+                    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+                    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+                ],
+            }),
+            passTag,
+            startIdx,
+            {
+                preferredModel: isFixed ? model : undefined,
+                onAttempt: (activeModel, attempt) => {
+                    requests++;
+                    if (chunk) {
+                        progress.setChunkMeta(chunk.index, { model: activeModel, attempts: attempt, requests });
+                    } else {
+                        progress.setModel(activeModel, { n: attempt, max: MAX_RETRIES_PER_MODEL });
                     }
-                }
+                },
+                onDelta: (acc) => {
+                    // El avance se mide sobre el audio COMPLETO del fragmento:
+                    // un rescate que empieza en el minuto 12 no devuelve la
+                    // barra al principio.
+                    const p = durationSeconds > 0
+                        ? Math.min(0.98, (offsetSec + progressFromTimestamps(acc, passDuration) * passDuration) / durationSeconds)
+                        : 0;
+                    // El texto que llega es el 85% restante del trabajo del fragmento.
+                    chunk?.onProgress?.(0.15 + p * 0.85);
+                    onProgress?.(0.5 + p * 0.45);
+                    if (!chunk) progress.setStreamCounters(acc.length);
+
+                    // Un modelo atascado ("no, no, no…") no se desatasca solo: se
+                    // queda repitiendo hasta agotar el presupuesto de tokens. Antes
+                    // había que pagar la respuesta entera y limpiarla después;
+                    // ahora se corta en cuanto se ve, y lo transcrito hasta ahí se
+                    // conserva. De volver a pedir lo que quedaba detrás se encarga
+                    // `transcribeWithLoopRecovery`, que es quien mira este texto.
+                    if (acc.length >= loopCheckAt) {
+                        loopCheckAt = acc.length + 3000;
+                        if (tailRepetitionRun(acc)) {
+                            console.warn(`[${passTag}] 🔁 Repetition loop detected — cutting the stream`);
+                            progress.pushEvent('warn', m(
+                                'El modelo se atascó repitiendo — se corta ahí',
+                                'The model got stuck repeating — cutting it short',
+                            ), { chunk: chunk?.index });
+                            return false;
+                        }
+                    }
+                },
             },
-        },
-    );
+        );
+
+        tokensTotal += out.tokensUsed;
+        modelUsed = out.modelUsed;
+        if (!isFixed && out.modelIndex > modelIndex) modelIndex = out.modelIndex;
+        lastFinishReason = out.finishReason;
+
+        if (!out.text) {
+            console.error(`[${passTag}] Finish Reason:`, out.finishReason);
+            // Un rescate vacío no invalida lo ya transcrito: se devuelve vacío y
+            // arriba queda el hueco señalado.
+            if (isRetry) return '';
+            throw new Error(`No se generó transcripción. Razón: ${out.finishReason || 'Desconocida'}`);
+        }
+
+        // Limpiar espacios dentro de los timestamps: [ 00:13:19] -> [00:13:19]
+        let passText = out.text.replace(/\[\s+(\d)/g, '[$1');
+
+        // POST-PROCESSING: Limpiar artifacts si llegó a MAX_TOKENS
+        if (out.finishReason === 'MAX_TOKENS') {
+            console.warn(`[${passTag}] ⚠️  Hit MAX_TOKENS - Cleaning artifacts...`);
+            const lastSec = lastTimestampSeconds(passText);
+            const lastLabel = lastSec !== null ? plainLabel(lastSec + offsetSec) : null;
+            passText = passText.replace(/(\b\w{1,4}\b)(?:\s+\1){5,}$/gi, '');
+            passText += `\n\n[⚠️ Transcripción cortada por límite de tokens${lastLabel ? `. Falta el audio a partir de ${lastLabel}` : ''}]`;
+        }
+
+        return passText;
+    };
+
+    // Transcribir, reintentando SÓLO el tramo que un bucle eche a perder.
+    const recovered = await transcribeWithLoopRecovery({
+        file,
+        durationSec: durationSeconds,
+        label: tag,
+        chunkIndex: chunk?.index,
+        timeBaseSec: chunk?.startSec ?? 0,
+        pass: runPass,
+    });
 
     onProgress?.(0.95);
 
-    if (!text) {
-        console.error(`[${tag}] Finish Reason:`, finishReason);
-        throw new Error(`No se generó transcripción. Razón: ${finishReason || 'Desconocida'}`);
-    }
+    // Red de seguridad: rachas demasiado cortas para justificar un rescate, o
+    // las que quedaron dentro del texto conservado.
+    const repCheck = stripRepetitionRuns(recovered.text);
+    const finalText = repCheck.removed > 0 ? repCheck.text : recovered.text;
 
-    // Limpiar espacios dentro de los timestamps: [ 00:13:19] -> [00:13:19]
-    let cleanText = text.replace(/\[\s+(\d)/g, '[$1');
-
-    const repCheck = stripRepetitionRuns(cleanText);
-    if (repCheck.removed > 0) {
-        cleanText = repCheck.text;
-    }
-
-    // POST-PROCESSING: Limpiar artifacts si llegó a MAX_TOKENS
-    if (finishReason === 'MAX_TOKENS') {
-        console.warn(`[${tag}] ⚠️  Hit MAX_TOKENS - Cleaning artifacts...`);
-        const lastSec = lastTimestampSeconds(cleanText);
-        const lastLabel = lastSec !== null ? plainLabel(lastSec) : null;
-        cleanText = cleanText.replace(/(\b\w{1,4}\b)(?:\s+\1){5,}$/gi, '');
-        cleanText += `\n\n[⚠️ Transcripción cortada por límite de tokens${lastLabel ? `. Falta el audio a partir de ${lastLabel}` : ''}]`;
-    }
-
-    const finalText = cleanText;
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    console.log(`[${tag}] ✅ ${modelUsed} · ${totalTime}s · ${finishReason} · ${tokensUsed} tok · ${finalText.length} chars`);
+    console.log(`[${tag}] ✅ ${modelUsed} · ${totalTime}s · ${lastFinishReason} · ${tokensTotal} tok · ${finalText.length} chars${recovered.recoveries ? ` · ${recovered.recoveries} rescate(s)` : ''}`);
 
     onProgress?.(1);
-    return { text: finalText, tokensUsed, modelIndex, modelUsed, requests };
+    return { text: finalText, tokensUsed: tokensTotal, modelIndex, modelUsed, requests };
 }
 
 /**

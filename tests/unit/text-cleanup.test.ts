@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
     stripRepetitionRuns,
     tailRepetitionRun,
+    repetitionResumePoint,
+    shiftTimestamps,
     lastTimestampSeconds,
     lastTimestampLabel,
 } from '../../src/lib/text-cleanup';
@@ -109,5 +111,50 @@ describe('timestamps', () => {
 
     it('devuelve la etiqueta tal cual para los avisos', () => {
         expect(lastTimestampLabel('[00:30] a [09:48] b')).toBe('[09:48]');
+    });
+});
+
+describe('punto de reanudación tras un bucle', () => {
+    it('corta por la marca que abre el segmento estropeado', () => {
+        const texto = fakeTranscript(0, 300) + repetitionLoop(400);
+        const punto = repetitionResumePoint(texto);
+
+        // `repetitionLoop` arranca con [09:48]: ése es el segundo desde el que
+        // hay que volver a pedir el audio.
+        expect(punto).not.toBeNull();
+        expect(punto!.resumeSec).toBe(588);
+        // Lo conservado llega hasta ahí y no incluye ni una repetición.
+        expect(punto!.kept).toContain('[04:30]');
+        expect(punto!.kept).not.toContain('[09:48]');
+        expect(punto!.kept).not.toMatch(/no, no/);
+    });
+
+    it('encuentra el bucle aunque el stream se cortara dentro de él', () => {
+        // Cortado en seco: la racha se queda sin separador final, que es justo
+        // lo que ocurre cuando la detección en caliente cierra el socket.
+        const cortado = (fakeTranscript(0, 300) + repetitionLoop(400)).trimEnd();
+        expect(repetitionResumePoint(cortado)?.resumeSec).toBe(588);
+    });
+
+    it('no ve nada donde no hay bucle', () => {
+        expect(repetitionResumePoint(fakeTranscript(0, 3600))).toBeNull();
+    });
+
+    it('se rinde si el bucle no tiene ninguna marca delante', () => {
+        // Sin marca no se sabe por qué segundo volver a empezar.
+        expect(repetitionResumePoint('no, '.repeat(200))).toBeNull();
+    });
+});
+
+describe('reubicar un trozo reintentado', () => {
+    it('desplaza todas las marcas y pasa a horas cuando toca', () => {
+        const movido = shiftTimestamps('[00:00] uno\n[10:00] dos', 3000);
+        expect(movido).toContain('[50:00] uno');
+        expect(movido).toContain('[01:00:00] dos');
+    });
+
+    it('sin desplazamiento no toca el texto', () => {
+        const texto = '[00:30] tal cual';
+        expect(shiftTimestamps(texto, 0)).toBe(texto);
     });
 });

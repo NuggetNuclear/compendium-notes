@@ -25,16 +25,25 @@ const WORD_RUN = /([^\s,;.:!?]{1,24})(?:[,;.:!?]*\s+)(?:\1[,;.:!?]*\s+){9,}/g;
 const PHRASE_RUN = /((?:\S{1,20}[ \t]+){2,6})\1{9,}/g;
 
 /**
+ * Los mismos dos patrones, anclados al final del texto.
+ *
+ * Sirven para dos cosas: cortar el stream en caliente, y localizar el bucle
+ * cuando el stream YA se cortó ahí — en ese caso la racha se queda sin el
+ * separador final que exigen `WORD_RUN` y `PHRASE_RUN`, y sin estas versiones
+ * el bucle que acabamos de detectar dejaría de verse un instante después.
+ */
+const TAIL_RUNS = [
+    /([^\s,;.:!?]{1,24})(?:[,;.:!?]*\s+)(?:\1[,;.:!?]*\s+){9,}[^\s]{0,24}[,;.:!?]*\s*$/,
+    /((?:\S{1,20}[ \t]+){2,6})\1{9,}\S{0,20}\s*$/,
+];
+
+/**
  * Racha degenerada al final del texto, para cortar el stream en caliente.
  * Sólo mira una ventana corta: interesa lo que el modelo escribe ahora.
  */
 export function tailRepetitionRun(text: string): { unit: string; count: number } | null {
     const tail = text.slice(-4000);
-    const anchored = [
-        /([^\s,;.:!?]{1,24})(?:[,;.:!?]*\s+)(?:\1[,;.:!?]*\s+){9,}[^\s]{0,24}[,;.:!?]*\s*$/,
-        /((?:\S{1,20}[ \t]+){2,6})\1{9,}\S{0,20}\s*$/,
-    ];
-    for (const re of anchored) {
+    for (const re of TAIL_RUNS) {
         const m = tail.match(re);
         if (m) {
             const unit = m[1];
@@ -42,6 +51,70 @@ export function tailRepetitionRun(text: string): { unit: string; count: number }
         }
     }
     return null;
+}
+
+/** Marca de tiempo `[MM:SS]` o `[HH:MM:SS]`. */
+const TIMESTAMP = /\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g;
+
+/** Segundos de una marca ya capturada. */
+function markSeconds(m: RegExpMatchArray): number {
+    return m[3] !== undefined
+        ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])
+        : Number(m[1]) * 60 + Number(m[2]);
+}
+
+/**
+ * Dónde empieza el bucle, y hasta dónde vale el texto anterior.
+ *
+ * Es lo que hace falta para REINTENTAR sólo el trozo estropeado en vez de
+ * repetir el fragmento entero. Un modelo atascado no se recupera solo: a partir
+ * del momento en que empieza a repetir, todo lo que escribe es basura y el
+ * audio que quedaba por transcribir se pierde. Pero lo de ANTES está bien, y
+ * son minutos de transcripción que no hay motivo para volver a pagar.
+ *
+ * El punto de corte es la última marca de tiempo que empieza en el bucle o
+ * antes: el segmento que ella abre es el que se echó a perder, así que se
+ * descarta entero y se vuelve a pedir desde su segundo. Cortar por la marca
+ * —y no por el carácter exacto donde arranca la repetición— evita quedarse con
+ * media frase, y hace que un falso positivo cueste una petición de más pero
+ * nunca texto perdido: ese tramo se transcribe otra vez.
+ *
+ * Devuelve `null` si no hay bucle, o si no hay ninguna marca de tiempo delante
+ * de él: sin marca no se sabe por qué segundo del audio volver a empezar.
+ */
+export function repetitionResumePoint(text: string): { kept: string; resumeSec: number } | null {
+    let start = Infinity;
+    for (const source of [WORD_RUN, PHRASE_RUN, ...TAIL_RUNS]) {
+        const m = new RegExp(source.source).exec(text);
+        if (m && m.index < start) start = m.index;
+    }
+    if (!Number.isFinite(start)) return null;
+
+    // La última marca que empieza en el bucle o antes. `start + 1` para que
+    // cuente también la marca que abre la línea donde arranca la repetición.
+    const marks = [...text.slice(0, start + 1).matchAll(TIMESTAMP)];
+    const last = marks[marks.length - 1];
+    if (!last) return null;
+
+    return { kept: text.slice(0, last.index).trimEnd(), resumeSec: markSeconds(last) };
+}
+
+/**
+ * Desplaza todas las marcas de tiempo del texto `offsetSec` segundos.
+ *
+ * Un trozo reintentado se transcribe como si fuera un audio nuevo —su primera
+ * palabra es `[00:00]`— porque eso es lo que ve el modelo. Para volver a
+ * pegarlo detrás de lo que ya había, sus marcas tienen que volver al reloj del
+ * fragmento del que salió.
+ */
+export function shiftTimestamps(text: string, offsetSec: number): string {
+    if (!offsetSec) return text;
+    return text.replace(TIMESTAMP, (_full, h: string, mm: string, ss?: string) =>
+        secondsToLabel(
+            (ss !== undefined
+                ? Number(h) * 3600 + Number(mm) * 60 + Number(ss)
+                : Number(h) * 60 + Number(mm)) + offsetSec,
+        ));
 }
 
 /**

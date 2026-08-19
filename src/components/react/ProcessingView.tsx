@@ -461,6 +461,7 @@ export default function ProcessingView() {
 
     const problema = failed ? friendlyError(snap.error, locale) : null;
     const esperandoModelo = !failed && snap.activeStage === 'transcribe' && waitingForModel(snap.chunks);
+    const hasGeminiIssues = snap.events.some((e) => e.kind === 'retry');
     const Icono = activeStage ? STAGE_ICON[activeStage.id] : Waves;
     const escuchado = listenedLine(snap.counters.audioDoneSec, snap.counters.audioTotalSec, locale);
 
@@ -628,8 +629,12 @@ export default function ProcessingView() {
                         style={{ color: 'var(--text-muted)' }}
                     >
                         {es
-                            ? 'Tu audio ya está subido. Esperando a que Gemini empiece a transcribir.'
-                            : 'Your audio is uploaded. Waiting for Gemini to start transcribing.'}
+                            ? (hasGeminiIssues
+                                ? 'Tu audio ya está subido. Gemini está sobrecargado, tu respuesta tardará más de lo esperado mientras los servidores de Google se recuperan.'
+                                : 'Tu audio ya está subido. Esperando a que Gemini empiece a transcribir.')
+                            : (hasGeminiIssues
+                                ? 'Your audio is uploaded. Gemini is overloaded, your response will take longer than expected while Google\'s servers recover.'
+                                : 'Your audio is uploaded. Waiting for Gemini to start transcribing.')}
                     </motion.p>
                 )}
                 {stalled && waitLeft === 0 && !esperandoModelo && (

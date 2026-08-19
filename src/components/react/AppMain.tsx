@@ -55,16 +55,27 @@ export default function AppMain() {
 
             let correctedStep = currentStep;
 
+            const urlParams = new URLSearchParams(window.location.search);
+            const isNewRequest = urlParams.get('new') === 'true';
+
+            if (isNewRequest && !isProcessing) {
+                correctedStep = 'upload';
+                // Remove the query param so it doesn't stick
+                const newUrl = new URL(window.location.href);
+                newUrl.searchParams.delete('new');
+                window.history.replaceState(history.state, '', newUrl.pathname + newUrl.hash);
+            }
+
             // 1. Force progression if processing
-            if (isProcessing && currentStep === 'upload') {
+            if (isProcessing && correctedStep === 'upload') {
                 correctedStep = 'transcribing';
             }
             // 2. Force retreat if no data and idle
-            else if (!hasNotes && !hasTrans && !isProcessing && !isFailed && (currentStep === 'ai-processing' || currentStep === 'editor' || currentStep === 'transcribing')) {
+            else if (!hasNotes && !hasTrans && !isProcessing && !isFailed && (correctedStep === 'ai-processing' || correctedStep === 'editor' || correctedStep === 'transcribing')) {
                 correctedStep = 'upload';
             }
-            // 3. Prevent stuck in upload if data exists
-            else if (hasNotes && currentStep === 'upload') {
+            // 3. Prevent stuck in upload if data exists, UNLESS user explicitly requested upload via query param
+            else if (hasNotes && correctedStep === 'upload' && !isNewRequest) {
                 correctedStep = 'editor';
             }
 
@@ -74,7 +85,7 @@ export default function AppMain() {
                 history.replaceState({ step: correctedStep }, '', `#${correctedStep}`);
             } else if (history.state?.step !== currentStep) {
                 // State sync: store changed (start/done), sync history
-                history.pushState({ step: currentStep }, '', `#${currentStep}`);
+                history.replaceState({ step: correctedStep }, '', `#${correctedStep}`);
             }
         };
 

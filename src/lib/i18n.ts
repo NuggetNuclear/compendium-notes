@@ -221,9 +221,10 @@ export const translations = {
     'app.editor.start_new': { es: 'Crear nuevo documento', en: 'Create new document' },
     'app.editor.copy': { es: 'Copiar', en: 'Copy' },
     'app.editor.copied': { es: 'Copiado', en: 'Copied' },
-    'app.editor.download': { es: 'Descargar PDF', en: 'Download PDF' },
+    'app.editor.download': { es: 'Exportar', en: 'Export' },
     'app.editor.downloading': { es: 'Generando...', en: 'Generating...' },
-    'app.editor.downloaded': { es: 'Descargado', en: 'Downloaded' },
+    'app.editor.download.md': { es: 'Descargar .MD', en: 'Download .MD' },
+    'app.editor.download.pdf': { es: 'Exportar a PDF', en: 'Export as PDF' },
     // Historial ("Ver archivos")
     'app.history.open': { es: 'Ver archivos', en: 'See files' },
     'app.history.title': { es: 'Tus archivos', en: 'Your files' },

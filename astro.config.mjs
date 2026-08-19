@@ -22,5 +22,12 @@ export default defineConfig({
     optimizeDeps: {
       exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
     },
+    // mathjax-full's version.js falls back to `eval('require')` to read its own
+    // package.json unless this global is predefined — its own build tooling
+    // (webpack DefinePlugin) sets it, and without it the fallback crashes in
+    // the browser, where `require` doesn't exist.
+    define: {
+      PACKAGE_VERSION: JSON.stringify('3.2.1'),
+    },
   },
 });

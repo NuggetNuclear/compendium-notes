@@ -103,25 +103,33 @@ export async function updateProjectState(
     projectId: number,
     updates: Partial<ProcessingState>
 ) {
-    const existing = await db.processingState.where({ projectId }).first();
-    if (existing) {
-        await db.processingState.update(existing.id!, {
-            ...updates,
-            lastUpdated: Date.now()
-        });
-    } else {
-        await db.processingState.add({
-            projectId,
-            step: 'upload',
-            subStep: 'idle',
-            progress: 0,
-            lastUpdated: Date.now(),
-            ...updates
-        } as ProcessingState);
-    }
+    // El progreso llama a esto varias veces por segundo sin esperar a que
+    // termine la llamada anterior. Sin transacción, dos llamadas concurrentes
+    // podían ver ambas que no existe fila (el primer `.add()` aún no había
+    // hecho commit) y crear dos filas para el mismo proyecto; `listHistory`
+    // podía entonces quedarse con la vacía y mostrar "sin apuntes" con los
+    // apuntes ya generados y guardados en la otra.
+    await db.transaction('rw', db.processingState, db.projects, async () => {
+        const existing = await db.processingState.where({ projectId }).first();
+        if (existing) {
+            await db.processingState.update(existing.id!, {
+                ...updates,
+                lastUpdated: Date.now()
+            });
+        } else {
+            await db.processingState.add({
+                projectId,
+                step: 'upload',
+                subStep: 'idle',
+                progress: 0,
+                lastUpdated: Date.now(),
+                ...updates
+            } as ProcessingState);
+        }
 
-    // Also touch the project to keep it fresh
-    await db.projects.update(projectId, { updatedAt: Date.now() });
+        // Also touch the project to keep it fresh
+        await db.projects.update(projectId, { updatedAt: Date.now() });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +174,22 @@ export async function listHistory(): Promise<HistoryEntry[]> {
     ]);
 
     const audioBy = new Map(audios.map((a) => [a.projectId, a]));
-    const stateBy = new Map(states.map((s) => [s.projectId, s]));
+
+    // Normalmente hay una fila de estado por proyecto, pero una carrera antigua
+    // en `updateProjectState` podía crear dos; si eso dejó una vacía y otra con
+    // los apuntes reales, quedarnos con la última del array al azar mostraba
+    // "sin apuntes" aunque sí los hubiera. Nos quedamos con la que tenga más
+    // contenido (y, a igualdad, la más reciente).
+    const stateBy = new Map<number, ProcessingState>();
+    for (const s of states) {
+        const prev = stateBy.get(s.projectId);
+        if (!prev) { stateBy.set(s.projectId, s); continue; }
+        const prevScore = (prev.organizedNotes?.trim() ? 2 : 0) + (prev.transcription?.trim() ? 1 : 0);
+        const score = (s.organizedNotes?.trim() ? 2 : 0) + (s.transcription?.trim() ? 1 : 0);
+        if (score > prevScore || (score === prevScore && s.lastUpdated > prev.lastUpdated)) {
+            stateBy.set(s.projectId, s);
+        }
+    }
 
     return projects.map((p) => {
         const audio = audioBy.get(p.id!);

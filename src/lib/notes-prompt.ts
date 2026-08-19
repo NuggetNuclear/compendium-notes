@@ -88,7 +88,7 @@ export function buildNotesPrompt(
 Write EVERYTHING in ${LANG}: the title, every heading, every paragraph, every question.${auto ? '' : ' Translate the content; do not leave anything in the original language.'}
 The headings below are English templates — translate them too.`;
 
-    const noPreamble = 'No preamble, no "here are your notes", no closing remarks, no emoji.\nClean Markdown. **Bold** for technical terms. Code blocks for code.\nFix the obvious errors of spoken transcription (false starts, repeated words), but never invent content that is not in the transcript. If something is unclear in the audio, leave it out rather than guessing.';
+    const noPreamble = 'No preamble, no "here are your notes", no closing remarks, no emoji.\nClean Markdown. **Bold** for technical terms. Code blocks for code.\nFix the obvious errors of spoken transcription (false starts, repeated words), but never invent content that is not in the transcript. If something is unclear in the audio, leave it out rather than guessing.\nAny mathematical notation (formulas, equations, variables with subscripts/superscripts, Greek letters) must be written as LaTeX wrapped in $ for inline math (e.g. $X(t)$, $a > 1$) or $$ on its own line for display equations (e.g. $$P(t) = \\frac{v^2(t)}{R}$$). Never write raw LaTeX commands like \\frac or \\int outside of $ delimiters.';
 
     // Continuación: sólo secciones de contenido, sin cabecera del documento.
     if (part && part.index > 0) {

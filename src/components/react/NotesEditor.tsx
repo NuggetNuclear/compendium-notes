@@ -16,6 +16,7 @@ export default function NotesEditor() {
     const [downloaded, setDownloaded] = useState(false);
     const [isStyleOpen, setIsStyleOpen] = useState(false);
     const [isPdfSettingsOpen, setIsPdfSettingsOpen] = useState(false);
+    const [isDownloadMenuOpen, setIsDownloadMenuOpen] = useState(false);
     const [activeTab, setActiveTab] = useState<'edit' | 'preview'>('preview');
     const [showTranscript, setShowTranscript] = useState(false);
     const [isResummarizing, setIsResummarizing] = useState(false);
@@ -174,6 +175,26 @@ export default function NotesEditor() {
         } finally {
             setDownloading(false);
         }
+    };
+
+    const handleDownloadMd = async () => {
+        let finalContent = showTranscript ? transcription : editedNotes;
+        if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
+        
+        const blob = new Blob([finalContent], { type: 'text/markdown;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const safeTitle = derivedTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        a.download = `${safeTitle}.md`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        setDownloaded(true);
+        setTimeout(() => setDownloaded(false), 3000);
+        setIsDownloadMenuOpen(false);
     };
 
     // Estilos de preview mejorados - escala aumentada para mejor legibilidad
@@ -713,17 +734,55 @@ export default function NotesEditor() {
                         )}
                     </div>
 
-                    <button
-                        onClick={handleDownload}
-                        disabled={downloading}
-                        className="flex items-center gap-2 text-xs px-2.5 py-1.5 rounded-md font-medium text-white transition-colors whitespace-nowrap"
-                        style={{ background: downloaded ? '#10b981' : 'var(--accent)' }}
-                    >
-                        {downloading ? <Loader2 size={14} className="animate-spin" /> : downloaded ? <Check size={14} /> : <Download size={14} />}
-                        <span className="hidden sm:inline">
-                            {downloading ? t('app.editor.downloading', locale) : downloaded ? t('app.editor.downloaded', locale) : t('app.editor.download', locale)}
-                        </span>
-                    </button>
+                    <div className="relative">
+                        <button
+                            onClick={() => setIsDownloadMenuOpen(!isDownloadMenuOpen)}
+                            disabled={downloading}
+                            className="flex items-center gap-2 text-xs px-2.5 py-1.5 rounded-md font-medium text-white transition-colors whitespace-nowrap"
+                            style={{ background: downloaded ? '#10b981' : 'var(--accent)' }}
+                        >
+                            {downloading ? <Loader2 size={14} className="animate-spin" /> : downloaded ? <Check size={14} /> : <Download size={14} />}
+                            <span className="hidden sm:inline">
+                                {downloading ? t('app.editor.downloading', locale) : downloaded ? t('app.editor.downloaded', locale) : t('app.editor.download', locale)}
+                            </span>
+                        </button>
+                        
+                        {isDownloadMenuOpen && (
+                            <>
+                                <div
+                                    className="fixed inset-0 z-40 bg-black/20 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none"
+                                    onClick={() => setIsDownloadMenuOpen(false)}
+                                />
+                                <div
+                                    className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] max-w-xs sm:absolute sm:top-full sm:right-0 sm:left-auto sm:translate-x-0 sm:translate-y-1 sm:w-48 p-1 rounded-lg shadow-2xl border border-[var(--border-subtle)] overflow-hidden z-50 flex flex-col"
+                                    style={{ background: 'var(--bg-secondary)' }}
+                                >
+                                    <button
+                                        onClick={async () => {
+                                            setIsDownloadMenuOpen(false);
+                                            await handleDownloadMd();
+                                        }}
+                                        className="text-left px-3 py-3 sm:py-2 text-sm sm:text-xs font-medium rounded-md transition-colors hover:bg-[var(--bg-tertiary)] flex items-center gap-2"
+                                        style={{ color: 'var(--text-primary)' }}
+                                    >
+                                        <FileText size={14} className="shrink-0" />
+                                        <span>{t('app.editor.download.md' as any, locale)}</span>
+                                    </button>
+                                    <button
+                                        onClick={async () => {
+                                            setIsDownloadMenuOpen(false);
+                                            await handleDownload();
+                                        }}
+                                        className="text-left px-3 py-3 sm:py-2 text-sm sm:text-xs font-medium rounded-md transition-colors hover:bg-[var(--bg-tertiary)] flex items-center gap-2 mt-1"
+                                        style={{ color: 'var(--text-primary)' }}
+                                    >
+                                        <ExternalLink size={14} className="shrink-0" />
+                                        <span>{t('app.editor.download.pdf' as any, locale)}</span>
+                                    </button>
+                                </div>
+                            </>
+                        )}
+                    </div>
                 </div>
             </div>
 

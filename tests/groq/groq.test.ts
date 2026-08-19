@@ -5,6 +5,7 @@ import {
     installMocks, groqStream, apiError, audioFile, repetitionLoop,
     mockAudioSlicing, restoreAudioSlicing,
 } from '../helpers/mock-gemini';
+import { TimeoutError } from '../../src/lib/pipeline-control';
 
 /** Respuesta de Whisper en el formato verbose_json que pide la app. */
 const whisper = (segments: Array<[number, string]>) =>
@@ -114,8 +115,13 @@ describe('Groq · transcripción con Whisper', () => {
             await expect(transcribeAudio([audioFile()], 'KEY')).rejects.toThrow(/Internal server error/);
         });
 
-        it('explica el timeout en lugar de soltar AbortError', async () => {
-            installMocks(() => { const e = new Error('aborted'); e.name = 'AbortError'; throw e; });
+        // El plazo agotado llega como `TimeoutError`, que es lo que produce
+        // `fetchWithTimeout`. Antes esta prueba lanzaba un `AbortError` a mano y
+        // pasaba en verde comprobando un camino que en producción no existía:
+        // el aborto se traduce dentro de `fetchWithTimeout` y nunca sale con ese
+        // nombre, así que el mensaje amable no se mostraba jamás.
+        it('explica el timeout en lugar de darlo por un fallo de red', async () => {
+            installMocks(() => { throw new TimeoutError('Groq (transcripción) no respondió en 120s'); });
             await expect(transcribeAudio([audioFile()], 'KEY')).rejects.toThrow(/tardó demasiado/);
         });
 
@@ -139,6 +145,23 @@ describe('Groq · organización con Llama', () => {
 
         expect(notas).toContain('## Título');
         expect(ctx.calls[0].body.stream).toBe(true);
+    });
+
+    it('avisa dentro del documento si los apuntes se cortan por el límite', async () => {
+        // 'length' es el MAX_TOKENS de la API estilo OpenAI. Antes se ignoraba
+        // y unos apuntes a medias salían con el aspecto de estar terminados.
+        installMocks(() => groqStream(NOTAS_GROQ, { finishReason: 'length' }));
+        const notas = await organizeNotes(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+        expect(notas).toContain('límite de escritura');
+        expect(notas).toContain('## Título');
+    });
+
+    it('no dice nada cuando los apuntes terminan bien', async () => {
+        installMocks(() => groqStream(NOTAS_GROQ, { finishReason: 'stop' }));
+        const notas = await organizeNotes(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+        expect(notas).not.toContain('⚠️');
     });
 
     it('publica el avance por secciones', async () => {

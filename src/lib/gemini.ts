@@ -3,7 +3,7 @@ const GEMINI_UPLOAD_URL = 'https://generativelanguage.googleapis.com/upload/v1be
 
 import { getLanguageNameEn } from './languages';
 import { progress, m } from './progress';
-import { stripRepetitionRuns, lastTimestampSeconds, secondsToLabel, tailRepetitionRun } from './text-cleanup';
+import { stripRepetitionRuns, lastTimestampSeconds, lastTimestampLabel, secondsToLabel, tailRepetitionRun } from './text-cleanup';
 import { transcribeWithLoopRecovery } from './loop-recovery';
 import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
 import { sanitizeDuration } from './duration';
@@ -342,6 +342,8 @@ const backoffMs = (attempt: number) => Math.min(Math.pow(2, attempt + 1) * 1000 
 const TIMEOUT_GENERATE_MS = 600_000;   // 10 min: transcripción u organización
 const TIMEOUT_UPLOAD_START_MS = 60_000;
 const TIMEOUT_UPLOAD_STATUS_MS = 30_000;
+/** Plazo para validar una key: si en 15s no contesta, no contesta. */
+const TIMEOUT_VALIDATE_MS = 15_000;
 function parseRetryDelayMs(err: any): number | null {
     const details = err?.error?.details;
     if (!Array.isArray(details)) return null;
@@ -464,6 +466,20 @@ const MAX_COOLDOWN_WAITS = 3;
 
 const modelHealth = new Map<string, { until: number; strikes: number }>();
 
+/**
+ * Modelos cuya cuota DIARIA (RPD) ya se sabe agotada en esta ejecución.
+ *
+ * Vivía dentro de `geminiGenerateWithFallback`, es decir, uno por llamada. Con
+ * seis fragmentos en paralelo, los seis descubrían por su cuenta que el modelo
+ * primario está sin cuota, y cada descubrimiento cuesta una petición y su
+ * respuesta 429. Un RPD agotado es un hecho de la cuenta, no de la llamada:
+ * compartirlo ahorra tantas peticiones inútiles como fragmentos haya.
+ *
+ * Se limpia en `resetModelHealth`, junto al resto del estado de la ejecución:
+ * la cuota del día siguiente no tiene por qué heredar la de hoy.
+ */
+const dailyExhausted = new Set<string>();
+
 /** Milisegundos que le quedan a un modelo en cuarentena (0 si está sano). */
 export function modelCooldownMs(model: string, now = Date.now()): number {
     const h = modelHealth.get(model);
@@ -514,6 +530,7 @@ let streamingDisabled = false;
 /** Empieza de cero. La llama cada ejecución nueva y las pruebas. */
 export function resetModelHealth(): void {
     modelHealth.clear();
+    dailyExhausted.clear();
     streamingDisabled = false;
 }
 
@@ -600,7 +617,6 @@ async function geminiGenerateWithFallback(
         ));
     };
     // Modelos con cuota DIARIA agotada: no tiene sentido volver a intentarlos hoy.
-    const dailyExhausted = new Set<string>();
     let lastError: Error | null = null;
     let sawOverload = false;
     const maxPasses = MAX_CHAIN_PASSES;
@@ -877,28 +893,70 @@ async function uploadToGemini(file: File, apiKey: string, onProgress?: (p: numbe
     onProgress?.(0.4);
 
     // Paso 3: Esperar a que esté ACTIVE
+    //
+    // El estado HTTP de esta consulta se ignoraba: se hacía `json()` directo con
+    // un `.catch(() => ({}))` detrás, así que un 403 (key sin permiso sobre el
+    // archivo) o un 500 devolvían un objeto vacío, el `state` no era ni ACTIVE
+    // ni FAILED, y el bucle daba sus 120 vueltas de 2 s antes de morir con
+    // "Timeout esperando procesamiento (4 minutos)". Cuatro minutos perdidos y
+    // un mensaje que señalaba al sitio equivocado.
     let attempts = 0;
+    /** Consultas seguidas que no dieron un estado legible. */
+    let consecutiveFailures = 0;
+    const MAX_STATUS_FAILURES = 3;
     console.log(`[Gemini Upload] Waiting for file processing...`);
 
     while (attempts < 120) {
         throwIfCancelled();
-        const statusRes = await fetchWithTimeout(
-            `${GEMINI_API_URL}/${fileName}?key=${apiKey}`,
-            {},
-            { timeoutMs: TIMEOUT_UPLOAD_STATUS_MS, label: 'Gemini (estado del archivo)' },
-        );
-        const statusData = await statusRes.json().catch(() => ({} as any));
 
-        if (statusData.state === 'ACTIVE') {
-            console.log('[Gemini Upload] ✅ File ready');
-            onProgress?.(0.5);
-            return fileUri;
-        }
-        if (statusData.state === 'FAILED') {
-            throw new Error(`Procesamiento falló: ${statusData.error?.message || 'Error desconocido'}`);
+        let statusData: any = null;
+        /** Motivo por el que esta vuelta no trajo estado, si es pasajero. */
+        let transient: string | null = null;
+
+        try {
+            const statusRes = await fetchWithTimeout(
+                `${GEMINI_API_URL}/${fileName}?key=${apiKey}`,
+                {},
+                { timeoutMs: TIMEOUT_UPLOAD_STATUS_MS, label: 'Gemini (estado del archivo)' },
+            );
+
+            if (statusRes.ok) {
+                statusData = await statusRes.json().catch(() => ({} as any));
+            } else {
+                const body = await statusRes.json().catch(() => ({} as any));
+                const apiMessage = body?.error?.message || `HTTP ${statusRes.status}`;
+                // 4xx que no sea 429: la consulta está mal planteada (key sin
+                // permiso, archivo que ya no existe). Esperar no la arregla.
+                if (statusRes.status < 500 && statusRes.status !== 429) {
+                    throw definitive(new Error(`No se pudo consultar el estado del audio subido: ${apiMessage}`));
+                }
+                transient = apiMessage;
+            }
+        } catch (e: any) {
+            if (isCancelledError(e) || isDefinitiveError(e)) throw e;
+            transient = e?.message || String(e);
         }
 
-        await new Promise(r => setTimeout(r, 2000));
+        if (transient !== null) {
+            if (++consecutiveFailures >= MAX_STATUS_FAILURES) {
+                throw new Error(`Gemini no informa del estado del audio subido: ${transient}`);
+            }
+            console.warn(`[Gemini Upload] ⚠️  Estado ilegible (${transient}) — reintento ${consecutiveFailures}/${MAX_STATUS_FAILURES}`);
+        } else {
+            consecutiveFailures = 0;
+            if (statusData?.state === 'ACTIVE') {
+                console.log('[Gemini Upload] ✅ File ready');
+                onProgress?.(0.5);
+                return fileUri;
+            }
+            if (statusData?.state === 'FAILED') {
+                throw new Error(`Procesamiento falló: ${statusData.error?.message || 'Error desconocido'}`);
+            }
+        }
+
+        // `sleep` y no un `setTimeout` pelado: durante esta espera el usuario
+        // puede cancelar, y antes no se le atendía hasta la vuelta siguiente.
+        await sleep(2000);
         attempts++;
 
         if (attempts % 10 === 0) {
@@ -1054,6 +1112,8 @@ export async function transcribeWithGemini(
                 break;
             } catch (e: any) {
                 if (isCancelledError(e)) throw e;
+                // Un 403 o un archivo que no existe no mejoran por reintentar.
+                if (isDefinitiveError(e)) throw e;
                 if (attempt >= MAX_UPLOAD_ATTEMPTS - 1) throw e;
                 const waitMs = backoffMs(attempt);
                 console.warn(`[${passTag}] ⚠️  Subida fallida (${e?.message || e}); reintento en ${(waitMs / 1000).toFixed(0)}s`);
@@ -1554,8 +1614,54 @@ export async function organizeNotesWithGemini(
 
     onStep?.(4);
     onStep?.(5);
-    const cleaned = stripRepetitionRuns(content).text;
+    let cleaned = stripRepetitionRuns(content).text;
+
+    // Unos apuntes cortados a la mitad salían como si estuvieran terminados.
+    //
+    // La redacción es UNA petición: el modelo escribe hasta donde llega y, si
+    // se queda sin presupuesto de salida (`MAX_TOKENS`) o lo para un filtro, el
+    // documento acaba a media frase. Aquí no se miraba `finishReason` —sólo se
+    // escribía en la consola—, así que la app daba el proceso por bueno, el PDF
+    // salía con la clase a medias y no había nada que explicara por qué. La
+    // ruta de la transcripción ya avisaba de esto; la de los apuntes, no.
+    if (finishReason && finishReason !== 'STOP') {
+        cleaned += `\n\n${notesCutMarker(finishReason, cleaned)}`;
+        progress.pushEvent('warn', finishReason === 'MAX_TOKENS'
+            ? m(
+                'Los apuntes se cortaron: el modelo llegó a su límite de escritura',
+                'The notes were cut short: the model hit its writing limit',
+            )
+            : m(
+                `Los apuntes se cortaron antes de tiempo (${finishReason})`,
+                `The notes were cut short (${finishReason})`,
+            ));
+    }
+
     return { notes: cleaned, tokensUsed };
+}
+
+/**
+ * Aviso, dentro del documento, de que los apuntes no llegaron al final.
+ *
+ * Va en el propio texto y no sólo en el registro porque el registro se cierra
+ * con la pestaña y el PDF se queda. Lleva el minuto hasta el que llegaron:
+ * las secciones de contenido empiezan por `### [MM:SS]`, así que el último de
+ * esos sellos dice exactamente por dónde se quedó respecto a la grabación.
+ */
+export function notesCutMarker(finishReason: string, notes: string): string {
+    const upTo = lastTimestampLabel(notes);
+    const hasta = upTo ? upTo.slice(1, -1) : null;
+
+    if (finishReason === 'MAX_TOKENS') {
+        return m(
+            `[⚠️ Los apuntes se cortan aquí: el modelo llegó a su límite de escritura${hasta ? ` y sólo cubren la clase hasta ${hasta}` : ''}. La transcripción está completa: puedes volver a generarlos con un nivel de resumen más corto.]`,
+            `[⚠️ The notes stop here: the model hit its writing limit${hasta ? ` and only cover the recording up to ${hasta}` : ''}. The transcript is complete: you can generate them again with a shorter summary level.]`,
+        );
+    }
+    return m(
+        `[⚠️ Los apuntes se cortan aquí (${finishReason})${hasta ? `: sólo cubren la clase hasta ${hasta}` : ''}. La transcripción está completa.]`,
+        `[⚠️ The notes stop here (${finishReason})${hasta ? `: they only cover the recording up to ${hasta}` : ''}. The transcript is complete.]`,
+    );
 }
 
 /**
@@ -1563,7 +1669,14 @@ export async function organizeNotesWithGemini(
  */
 export async function validateGeminiKey(apiKey: string): Promise<boolean> {
     try {
-        const response = await fetch(`${GEMINI_API_URL}/models?key=${apiKey}&pageSize=1`);
+        // `detached`: se valida desde la configuración, fuera de toda ejecución.
+        // Iba con `fetch` pelado —sin plazo— y una conexión colgada dejaba el
+        // modal esperando para siempre, sin forma de cancelar.
+        const response = await fetchWithTimeout(
+            `${GEMINI_API_URL}/models?key=${apiKey}&pageSize=1`,
+            {},
+            { timeoutMs: TIMEOUT_VALIDATE_MS, label: 'Gemini', detached: true },
+        );
         return response.ok;
     } catch (e) {
         console.error('Gemini validation error:', e);

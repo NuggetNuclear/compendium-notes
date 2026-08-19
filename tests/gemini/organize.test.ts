@@ -32,6 +32,47 @@ describe('organización de apuntes con Gemini', () => {
         expect(r.tokensUsed).toBe(4321);
     });
 
+    describe('apuntes que se cortan a la mitad', () => {
+        /**
+         * Lo observado: el PDF terminaba a media clase y nada lo decía. La
+         * redacción es UNA petición, y si el modelo agota su presupuesto de
+         * escritura el documento acaba donde acabe. `finishReason` traía el
+         * aviso desde el principio; sólo se escribía en la consola.
+         */
+        it('avisa dentro del documento cuando el modelo agota su límite', async () => {
+            installMocks(() => geminiStream(NOTAS, { finishReason: 'MAX_TOKENS' }));
+            const r = await organizeNotesWithGemini(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+            expect(r.notes).toContain('límite de escritura');
+            // Y dice hasta qué minuto de la clase llegaron los apuntes.
+            expect(r.notes).toContain('hasta 00:00');
+            // Lo redactado sigue estando entero.
+            expect(r.notes).toContain('# Introducción a la Criptografía');
+        });
+
+        it('lo cuenta también en el registro de la ejecución', async () => {
+            installMocks(() => geminiStream(NOTAS, { finishReason: 'MAX_TOKENS' }));
+            await organizeNotesWithGemini(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+            const eventos = progress.getSnapshot().events.map(e => e.text).join(' | ');
+            expect(eventos).toMatch(/límite de escritura/);
+        });
+
+        it('señala cualquier otro final anómalo, no sólo el de tokens', async () => {
+            installMocks(() => geminiStream(NOTAS, { finishReason: 'RECITATION' }));
+            const r = await organizeNotesWithGemini(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+            expect(r.notes).toContain('RECITATION');
+        });
+
+        it('no dice nada cuando los apuntes terminan bien', async () => {
+            installMocks(() => geminiStream(NOTAS));
+            const r = await organizeNotesWithGemini(transcripcion, 'KEY', undefined, 'short', 'auto');
+
+            expect(r.notes).not.toContain('⚠️');
+        });
+    });
+
     it('publica el avance por secciones', async () => {
         const ctx = installMocks(() => geminiStream(NOTAS));
         const detalles: string[] = [];

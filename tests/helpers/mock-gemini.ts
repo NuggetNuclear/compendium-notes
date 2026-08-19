@@ -24,6 +24,8 @@ export interface RecordedCall {
 export interface MockContext {
     calls: RecordedCall[];
     uploads: number;
+    /** Consultas al endpoint que dice si el archivo subido ya está ACTIVE. */
+    statusPolls: number;
     /** Peticiones que incluyen el audio del fragmento `i` (0-indexado). */
     callsFor(index: number): RecordedCall[];
     uriOf(index: number): string;
@@ -44,13 +46,22 @@ export function geminiStream(text: string, opts: { finishReason?: string; tokens
     }), { status: 200, headers: { 'content-type': 'application/json' } });
 }
 
-/** Respuesta SSE al estilo OpenAI, que es la que usa Groq. */
-export function groqStream(text: string): Response {
+/**
+ * Respuesta SSE al estilo OpenAI, que es la que usa Groq.
+ *
+ * `finishReason` va en un último trozo sin texto, igual que lo manda la API:
+ * `'length'` es su forma de decir que el modelo se quedó sin sitio para
+ * escribir y que la respuesta está cortada.
+ */
+export function groqStream(text: string, opts: { finishReason?: string } = {}): Response {
     const enc = new TextEncoder();
     return new Response(new ReadableStream({
         start(controller) {
             for (const line of text.split('\n')) {
                 controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: line + '\n' } }] })}\n\n`));
+            }
+            if (opts.finishReason) {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: opts.finishReason }] })}\n\n`));
             }
             controller.enqueue(enc.encode('data: [DONE]\n\n'));
             controller.close();
@@ -162,11 +173,13 @@ export function installMocks(handler: Handler): MockContext {
         uploads: 0,
         callsFor(index) { return this.calls.filter(c => c.uris.includes(this.uriOf(index))); },
         uriOf(index) { return `files/upload${index + 1}`; },
-        reset() { this.calls = []; this.uploads = 0; FakeXHR.counter = 0; },
+        statusPolls: 0,
+        reset() { this.calls = []; this.uploads = 0; this.statusPolls = 0; FakeXHR.counter = 0; },
     };
 
     FakeXHR.counter = 0;
     FakeXHR.failNext = false;
+    fileStatusHandler = null;
     (globalThis as any).XMLHttpRequest = FakeXHR;
 
     // Instalar dobles de red = empezar una ejecución nueva. La cuarentena de
@@ -194,6 +207,8 @@ export function installMocks(handler: Handler): MockContext {
             return new Response(JSON.stringify({ file: { uri: `files/upload${num}`, name: `files/upload${num}` } }), { status: 200 });
         }
         if (url.includes('/v1beta/files/')) {
+            ctx.statusPolls++;
+            if (fileStatusHandler) return fileStatusHandler(ctx.statusPolls);
             return new Response(JSON.stringify({ state: 'ACTIVE' }), { status: 200 });
         }
         if (url.includes('/models?key=')) {
@@ -218,6 +233,18 @@ export function installMocks(handler: Handler): MockContext {
     });
 
     return ctx;
+}
+
+let fileStatusHandler: ((poll: number) => Response) | null = null;
+
+/**
+ * Sustituye la respuesta de "¿ya está listo el archivo subido?".
+ *
+ * Recibe el número de consulta (1, 2, 3…) para poder simular una recuperación
+ * a la tercera, o un fallo sostenido. `null` restaura el ACTIVE inmediato.
+ */
+export function stubFileStatus(fn: ((poll: number) => Response) | null) {
+    fileStatusHandler = fn;
 }
 
 let failNextUploadFlag = false;

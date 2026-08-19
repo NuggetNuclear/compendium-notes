@@ -4,6 +4,7 @@ import { progress } from '../../src/lib/progress';
 import {
     installMocks, failNextUpload, geminiStream, fakeTranscript, audioFile,
     rateLimit, dailyQuota, overloaded, badKey, badRequest, modelNotFound,
+    stubFileStatus,
 } from '../helpers/mock-gemini';
 
 /**
@@ -85,6 +86,26 @@ describe('errores de la API de Gemini', () => {
         it('mensaje explícito si TODOS los modelos han agotado su cuota diaria', async () => {
             installMocks(() => dailyQuota());
             await expect(transcribir()).rejects.toThrow(/cuota diaria/i);
+        });
+
+        /**
+         * El RPD agotado es un hecho de la CUENTA, no de la llamada. Se guardaba
+         * en un `Set` local de `geminiGenerateWithFallback`, así que cada
+         * fragmento volvía a descubrirlo por su cuenta: con seis fragmentos en
+         * paralelo, seis peticiones y seis 429 para averiguar lo mismo.
+         */
+        it('lo aprendido sobre el RPD vale para el resto de la ejecución', async () => {
+            const ctx = installMocks((c) =>
+                c.model === GEMINI_MODEL_CHAIN[0] ? dailyQuota() : geminiStream(fakeTranscript(0, 300)));
+
+            await transcribir();
+            const trasLaPrimera = ctx.calls.filter(c => c.model === GEMINI_MODEL_CHAIN[0]).length;
+            await transcribir();
+
+            // La segunda transcripción ya no vuelve a picar contra el modelo sin
+            // cuota: arranca directamente en el que sí responde.
+            expect(ctx.calls.filter(c => c.model === GEMINI_MODEL_CHAIN[0])).toHaveLength(trasLaPrimera);
+            expect(ctx.calls.at(-1)!.model).toBe(GEMINI_MODEL_CHAIN[1]);
         });
 
         it('lo cuenta en el registro con el modelo afectado', async () => {
@@ -199,6 +220,54 @@ describe('errores de la API de Gemini', () => {
         it('propaga el error cuando el inicio de subida no es 200', async () => {
             vi.stubGlobal('fetch', async () => new Response('quota exceeded', { status: 429 }));
             await expect(transcribir()).rejects.toThrow(/iniciar upload/i);
+        });
+    });
+
+    /**
+     * El estado del archivo subido se consultaba ignorando el código HTTP: un
+     * 403 devolvía `{}` por el `.catch`, el `state` no era ni ACTIVE ni FAILED,
+     * y el bucle gastaba sus 120 vueltas antes de culpar a un timeout que no
+     * era. Lo que se comprueba aquí es que se rinde pronto y dice por qué.
+     */
+    describe('estado del archivo subido', () => {
+        it('un 403 al consultar el estado falla en el acto, sin agotar el bucle', async () => {
+            const ctx = installMocks(() => geminiStream(''));
+            stubFileStatus(() => badKey());
+
+            await expect(transcribir()).rejects.toThrow(/estado del audio subido/i);
+            // Lo que importa: UNA consulta, no ciento veinte.
+            expect(ctx.statusPolls).toBe(1);
+        });
+
+        it('un 500 se reintenta, pero no para siempre', async () => {
+            const ctx = installMocks(() => geminiStream(''));
+            stubFileStatus(() => new Response(JSON.stringify({ error: { message: 'backend error' } }), { status: 500 }));
+
+            await expect(transcribir()).rejects.toThrow(/no informa del estado/i);
+            // 3 consultas por subida, y la subida tiene un segundo intento:
+            // un 5xx sostenido es pasajero por definición, así que volver a
+            // subir el audio es una recuperación legítima. Seis, y se acabó.
+            expect(ctx.statusPolls).toBe(6);
+        });
+
+        it('un 500 pasajero no tira la subida: a la tercera responde', async () => {
+            const ctx = installMocks(() => geminiStream(fakeTranscript(0, 600)));
+            stubFileStatus((poll) => poll < 3
+                ? new Response('{}', { status: 503 })
+                : new Response(JSON.stringify({ state: 'ACTIVE' }), { status: 200 }));
+
+            await expect(transcribir()).resolves.toBeTruthy();
+            expect(ctx.statusPolls).toBe(3);
+        });
+
+        it('FAILED se distingue de una consulta que falla', async () => {
+            installMocks(() => geminiStream(''));
+            stubFileStatus(() => new Response(
+                JSON.stringify({ state: 'FAILED', error: { message: 'unsupported codec' } }),
+                { status: 200 },
+            ));
+
+            await expect(transcribir()).rejects.toThrow(/unsupported codec/);
         });
     });
 

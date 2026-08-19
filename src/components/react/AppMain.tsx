@@ -7,6 +7,7 @@ import UploadZone from './UploadZone';
 import ConfigModal from './ConfigModal';
 import ProcessingView from './ProcessingView';
 import NotesEditor from './NotesEditor';
+import HistoryPanel from './HistoryPanel';
 
 // --- AJUSTE DE POSICIÓN VERTICAL ---
 // Modifica estos valores para subir o bajar el contenido:
@@ -16,7 +17,7 @@ const MOBILE_VERTICAL_OFFSET = "-60px"; // Ajuste para teléfono
 // ------------------------------------
 
 export default function AppMain() {
-    const { step, configOpen, setConfigOpen, error, setError, apiKey, geminiKey, provider, locale, setLocale, processingState, theme, toggleTheme } = useAppStore();
+    const { step, configOpen, setConfigOpen, historyOpen, setHistoryOpen, error, setError, apiKey, geminiKey, provider, locale, setLocale, processingState, theme, toggleTheme } = useAppStore();
 
     const isConnected = provider === 'gemini' ? !!geminiKey : !!apiKey;
     const providerLabel = provider === 'gemini' ? 'Gemini' : 'Groq';
@@ -161,6 +162,14 @@ export default function AppMain() {
         return () => window.removeEventListener('scn-open-config' as any, handleOpenConfig);
     }, [setConfigOpen]);
 
+    // El botón vive en la barra de navegación, que es Astro y no comparte
+    // estado con React: se comunica por evento, igual que la configuración.
+    useEffect(() => {
+        const handleOpenHistory = () => setHistoryOpen(true);
+        window.addEventListener('scn-open-history' as any, handleOpenHistory);
+        return () => window.removeEventListener('scn-open-history' as any, handleOpenHistory);
+    }, [setHistoryOpen]);
+
     return (
         <div className="min-h-screen flex flex-col pt-14" style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
             <main className="flex-1 relative w-full overflow-hidden" style={{ minHeight: 'calc(100vh - 3.5rem)' }}>
@@ -216,6 +225,11 @@ export default function AppMain() {
             {/* Config modal */}
             <AnimatePresence>
                 {configOpen && <ConfigModal />}
+            </AnimatePresence>
+
+            {/* Historial de archivos y apuntes */}
+            <AnimatePresence>
+                {historyOpen && <HistoryPanel />}
             </AnimatePresence>
         </div>
     );

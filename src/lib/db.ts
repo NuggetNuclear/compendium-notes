@@ -123,3 +123,121 @@ export async function updateProjectState(
     // Also touch the project to keep it fresh
     await db.projects.update(projectId, { updatedAt: Date.now() });
 }
+
+// ---------------------------------------------------------------------------
+// Historial: lo que ya está guardado, listado para poder volver a ello
+// ---------------------------------------------------------------------------
+
+/**
+ * Una entrada del historial: lo justo para pintar una fila.
+ *
+ * Deliberadamente NO lleva ni el audio ni los textos completos. La lista puede
+ * tener cincuenta clases de dos horas; arrastrar cada transcripción entera
+ * hasta el render sería cargar megas en memoria para enseñar "1.234 palabras".
+ * Los textos se piden uno a uno, sólo cuando se abre esa entrada.
+ */
+export interface HistoryEntry {
+    id: number;
+    title: string;
+    createdAt: number;
+    updatedAt: number;
+    status: Project['status'];
+    /** Nombre y tamaño del audio original, si se conserva. */
+    audio: { name: string; type: string; size: number } | null;
+    hasTranscription: boolean;
+    hasNotes: boolean;
+    /** Palabras de los apuntes; 0 si no llegaron a generarse. */
+    noteWords: number;
+    /** Caracteres de la transcripción. */
+    transcriptChars: number;
+    provider?: string;
+    durationMinutes?: string;
+}
+
+/** Todo lo guardado, de lo más reciente a lo más antiguo. */
+export async function listHistory(): Promise<HistoryEntry[]> {
+    const projects = await db.projects.orderBy('updatedAt').reverse().toArray();
+    if (projects.length === 0) return [];
+
+    const ids = projects.map((p) => p.id!).filter((id) => id !== undefined);
+    const [audios, states] = await Promise.all([
+        db.audioSource.where('projectId').anyOf(ids).toArray(),
+        db.processingState.where('projectId').anyOf(ids).toArray(),
+    ]);
+
+    const audioBy = new Map(audios.map((a) => [a.projectId, a]));
+    const stateBy = new Map(states.map((s) => [s.projectId, s]));
+
+    return projects.map((p) => {
+        const audio = audioBy.get(p.id!);
+        const state = stateBy.get(p.id!);
+        const notes = state?.organizedNotes ?? '';
+        const transcript = state?.transcription ?? '';
+
+        return {
+            id: p.id!,
+            title: p.title,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+            status: p.status,
+            // Del audio sólo viajan los metadatos: el Blob se queda en la base.
+            audio: audio
+                ? { name: audio.name, type: audio.type, size: Number(audio.file?.size) || 0 }
+                : null,
+            hasTranscription: transcript.trim().length > 0,
+            hasNotes: notes.trim().length > 0,
+            noteWords: notes.trim() ? notes.trim().split(/\s+/).length : 0,
+            transcriptChars: transcript.length,
+            provider: state?.metadata?.provider,
+            durationMinutes: state?.metadata?.durationMinutes,
+        };
+    });
+}
+
+/** Todo lo de un proyecto: textos y audio rehidratado como `File`. */
+export async function loadProject(projectId: number): Promise<{
+    project: Project;
+    file: File | null;
+    transcription: string;
+    organizedNotes: string;
+} | null> {
+    const project = await db.projects.get(projectId);
+    if (!project) return null;
+
+    const [audio, state] = await Promise.all([
+        db.audioSource.where({ projectId }).first(),
+        db.processingState.where({ projectId }).first(),
+    ]);
+
+    return {
+        project,
+        file: audio ? new File([audio.file], audio.name, { type: audio.type }) : null,
+        transcription: state?.transcription ?? '',
+        organizedNotes: state?.organizedNotes ?? '',
+    };
+}
+
+/**
+ * Borra un proyecto y todo lo que cuelga de él.
+ *
+ * Las tres tablas van juntas o no va ninguna: dejar el audio de un proyecto que
+ * ya no existe es ocupar disco que nadie va a poder liberar desde la interfaz.
+ */
+export async function deleteProject(projectId: number): Promise<void> {
+    await db.transaction('rw', db.projects, db.audioSource, db.processingState, async () => {
+        await db.audioSource.where({ projectId }).delete();
+        await db.processingState.where({ projectId }).delete();
+        await db.projects.delete(projectId);
+    });
+}
+
+/** Sólo el audio de un proyecto, para descargarlo o reproducirlo. */
+export async function loadProjectAudio(projectId: number): Promise<File | null> {
+    const audio = await db.audioSource.where({ projectId }).first();
+    return audio ? new File([audio.file], audio.name, { type: audio.type }) : null;
+}
+
+/** Marca un proyecto como el último usado, sin tocar su contenido. */
+export async function touchProject(projectId: number): Promise<void> {
+    await db.projects.update(projectId, { updatedAt: Date.now() });
+}

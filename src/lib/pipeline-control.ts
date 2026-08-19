@@ -26,6 +26,27 @@ export function isCancelledError(e: unknown): boolean {
     return e instanceof CancelledError || (e as any)?.cancelled === true;
 }
 
+/**
+ * Se lanza cuando una petición agota su plazo.
+ *
+ * Antes esto era un `Error` pelado, y quien quisiera distinguir un plazo
+ * agotado de cualquier otro fallo de red no tenía por dónde agarrarlo:
+ * `groq.ts` lo intentaba con `err.name === 'AbortError'`, que nunca llegaba a
+ * ser cierto porque el `AbortError` se traduce aquí dentro. El aviso que ese
+ * `if` quería dar —"prueba con un archivo más corto"— no se mostró jamás.
+ */
+export class TimeoutError extends Error {
+    readonly timedOut = true;
+    constructor(message: string) {
+        super(message);
+        this.name = 'TimeoutError';
+    }
+}
+
+export function isTimeoutError(e: unknown): boolean {
+    return e instanceof TimeoutError || (e as any)?.timedOut === true;
+}
+
 /** Plazo por defecto de una petición: generoso, pero no infinito. */
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -96,11 +117,17 @@ export function sleep(ms: number): Promise<void> {
 export async function fetchWithTimeout(
     url: string,
     init: RequestInit = {},
-    opts: { timeoutMs?: number; label?: string } = {},
+    opts: { timeoutMs?: number; label?: string; detached?: boolean } = {},
 ): Promise<Response> {
-    const { timeoutMs = DEFAULT_TIMEOUT_MS, label = 'el servidor' } = opts;
+    const { timeoutMs = DEFAULT_TIMEOUT_MS, label = 'el servidor', detached = false } = opts;
 
-    const run = currentSignal();
+    // `detached` es para lo que NO forma parte de una ejecución: validar una
+    // API Key desde la configuración, por ejemplo. Esas peticiones quieren el
+    // plazo, pero no la señal de cancelación: la señal abortada se conserva a
+    // propósito entre ejecuciones (ver `abortRun`), así que atarlas a ella hacía
+    // que, después de cancelar un proceso, cualquier validación fallara al
+    // instante con "Proceso cancelado" y sin haber salido a la red.
+    const run = detached ? null : currentSignal();
     if (run?.aborted) throw new CancelledError();
 
     const ctrl = new AbortController();
@@ -115,7 +142,7 @@ export async function fetchWithTimeout(
     } catch (e: any) {
         if (run?.aborted) throw new CancelledError();
         if (timedOut) {
-            throw new Error(`${label} no respondió en ${Math.round(timeoutMs / 1000)}s`);
+            throw new TimeoutError(`${label} no respondió en ${Math.round(timeoutMs / 1000)}s`);
         }
         throw e;
     } finally {

@@ -1,9 +1,9 @@
 const GROQ_API_URL = 'https://api.groq.com/openai/v1';
 import { progress, m as msg } from './progress';
 import { forEachSSE } from './sse';
-import { stripRepetitionRuns, tailRepetitionRun, secondsToLabel } from './text-cleanup';
+import { stripRepetitionRuns, tailRepetitionRun, lastTimestampLabel, secondsToLabel } from './text-cleanup';
 import { transcribeWithLoopRecovery } from './loop-recovery';
-import { sleep, fetchWithTimeout, isCancelledError, throwIfCancelled } from './pipeline-control';
+import { sleep, fetchWithTimeout, isCancelledError, isTimeoutError, throwIfCancelled } from './pipeline-control';
 
 /**
  * Error de Groq que sabe si tiene arreglo.
@@ -154,7 +154,12 @@ async function transcribeSingleFile(
         // La cancelación del usuario no es un fallo del fragmento: sube tal cual.
         if (isCancelledError(err)) throw err;
         if (chunkIndex !== undefined) progress.setChunk(chunkIndex, 'error');
-        if (err?.name === 'AbortError') {
+        // Plazo agotado. Se reintenta —puede ser una lentitud pasajera— pero el
+        // mensaje dice lo que de verdad ayuda si vuelve a pasar. Esto se
+        // comprobaba con `err.name === 'AbortError'`, que nunca era cierto:
+        // `fetchWithTimeout` ya traduce el aborto, así que el aviso caía en el
+        // catch-all genérico y el usuario leía "Error de red".
+        if (isTimeoutError(err)) {
             throw new GroqError(
                 'La transcripción tardó demasiado (timeout). Intenta con un archivo más corto o comprimido.',
                 true,
@@ -699,23 +704,52 @@ async function callTextModel(
             : msg('Analizando la transcripción', 'Analyzing the transcript'));
     };
 
+    // `finish_reason` viaja en el último trozo del stream y hasta ahora se
+    // tiraba. Es el único aviso de que el modelo se quedó sin sitio para
+    // escribir: sin leerlo, unos apuntes cortados a la mitad salen del pipeline
+    // con el mismo aspecto que unos terminados.
+    let finishReason: string | null = null;
+
     await forEachSSE(response, `Groq (${model})`, (parsed) => {
-        const delta = parsed.choices?.[0]?.delta?.content;
+        const choice = parsed.choices?.[0];
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice?.delta?.content;
         if (!delta) return;
         content += delta;
         return publish();
     });
 
-    const { text: cleaned } = stripRepetitionRuns(content);
+    let { text: cleaned } = stripRepetitionRuns(content);
+
+    // 'length' es el `MAX_TOKENS` de la API de estilo OpenAI.
+    if (cleaned && finishReason === 'length') {
+        const hasta = lastTimestampLabel(cleaned);
+        console.warn(`[Groq] ⚠️  Apuntes cortados por límite de tokens (${model})`);
+        progress.pushEvent('warn', msg(
+            'Los apuntes se cortaron: el modelo llegó a su límite de escritura',
+            'The notes were cut short: the model hit its writing limit',
+        ));
+        cleaned += '\n\n' + msg(
+            `[⚠️ Los apuntes se cortan aquí: el modelo llegó a su límite de escritura${hasta ? ` y sólo cubren la clase hasta ${hasta.slice(1, -1)}` : ''}. La transcripción está completa.]`,
+            `[⚠️ The notes stop here: the model hit its writing limit${hasta ? ` and only cover the recording up to ${hasta.slice(1, -1)}` : ''}. The transcript is complete.]`,
+        );
+    }
+
     return cleaned || null;
 }
 
+/** Plazo para validar una key: si en 15s no contesta, no contesta. */
+const TIMEOUT_VALIDATE_MS = 15_000;
+
 export async function validateGroqKey(apiKey: string): Promise<boolean> {
     try {
-        const response = await fetch(`${GROQ_API_URL}/models`, {
+        // `detached`: la validación se lanza desde la configuración, fuera de
+        // cualquier ejecución. Iba con `fetch` pelado —sin plazo— y una
+        // conexión colgada dejaba el modal esperando para siempre.
+        const response = await fetchWithTimeout(`${GROQ_API_URL}/models`, {
             method: 'GET',
             headers: { 'Authorization': `Bearer ${apiKey}` },
-        });
+        }, { timeoutMs: TIMEOUT_VALIDATE_MS, label: 'Groq', detached: true });
         return response.ok;
     } catch (e) {
         console.error('Groq validation error:', e);

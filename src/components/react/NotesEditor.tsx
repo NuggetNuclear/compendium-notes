@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Copy, Check, Download, Loader2, RotateCcw, PenLine, Eye, FileText, ExternalLink, Palette, MessageSquareText, Sparkles, Play, Pause, Volume2, VolumeX, Type, Clock, Hash } from 'lucide-react';
+import { Copy, Check, Download, Loader2, RotateCcw, PenLine, Eye, FileText, ExternalLink, Palette, MessageSquareText, Sparkles, Play, Pause, Volume2, VolumeX, Type, Clock, Hash, Settings } from 'lucide-react';
 import { useAppStore } from '../../lib/store';
 import type { SummaryLevel } from '../../lib/store';
 import { t } from '../../lib/i18n';
@@ -15,6 +15,7 @@ export default function NotesEditor() {
     const [downloading, setDownloading] = useState(false);
     const [downloaded, setDownloaded] = useState(false);
     const [isStyleOpen, setIsStyleOpen] = useState(false);
+    const [isPdfSettingsOpen, setIsPdfSettingsOpen] = useState(false);
     const [activeTab, setActiveTab] = useState<'edit' | 'preview'>('preview');
     const [showTranscript, setShowTranscript] = useState(false);
     const [isResummarizing, setIsResummarizing] = useState(false);
@@ -164,6 +165,7 @@ export default function NotesEditor() {
                 content: finalContent,
                 style: pdfStyle,
                 locale: locale,
+                isPlainText: showTranscript,
             });
             setDownloaded(true);
             setTimeout(() => setDownloaded(false), 3000);
@@ -644,27 +646,72 @@ export default function NotesEditor() {
 
                     <div className="w-px h-4 mx-1 hidden sm:block" style={{ background: 'var(--border-subtle)' }}></div>
 
-                    <button
-                        onClick={async () => {
-                            let finalContent = showTranscript ? transcription : editedNotes;
-                            if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
-                            const url = await generatePdf({
-                                title: derivedTitle,
-                                date: new Date().toLocaleDateString(locale === 'es' ? 'es-CL' : 'en-US'),
-                                duration: '',
-                                content: finalContent,
-                                style: pdfStyle,
-                                locale: locale,
-                            }, 'blob');
-                            if (url && typeof url === 'string') window.open(url, '_blank');
-                        }}
-                        className="flex items-center gap-2 text-xs px-2.5 py-1.5 rounded-md transition-colors whitespace-nowrap"
-                        style={{ color: 'var(--text-primary)', border: '1px solid var(--border-subtle)' }}
-                        title={locale === 'es' ? 'Ver PDF' : 'View PDF'}
-                    >
-                        <FileText size={14} />
-                        <span className="hidden md:inline">PDF</span>
-                    </button>
+                    <div className="relative flex items-center h-full">
+                        <button
+                            onClick={async () => {
+                                let finalContent = showTranscript ? transcription : editedNotes;
+                                if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
+                                const url = await generatePdf({
+                                    title: derivedTitle,
+                                    date: new Date().toLocaleDateString(locale === 'es' ? 'es-CL' : 'en-US'),
+                                    duration: '',
+                                    content: finalContent,
+                                    style: pdfStyle,
+                                    locale: locale,
+                                    isPlainText: showTranscript,
+                                }, 'blob');
+                                if (url && typeof url === 'string') window.open(url, '_blank');
+                            }}
+                            className="flex items-center gap-2 text-xs px-2.5 py-1.5 rounded-l-md transition-colors whitespace-nowrap h-full"
+                            style={{ color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRight: 'none' }}
+                            title={locale === 'es' ? 'Ver PDF' : 'View PDF'}
+                        >
+                            <FileText size={14} />
+                            <span className="hidden md:inline">PDF</span>
+                        </button>
+                        <button
+                            onClick={() => setIsPdfSettingsOpen(!isPdfSettingsOpen)}
+                            className="flex items-center justify-center px-1.5 py-1.5 rounded-r-md transition-colors h-full"
+                            style={{ color: 'var(--text-primary)', border: '1px solid var(--border-subtle)' }}
+                        >
+                            <Settings size={14} />
+                        </button>
+                        
+                        {isPdfSettingsOpen && (
+                            <>
+                                <div
+                                    className="fixed inset-0 z-40 bg-black/20 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none"
+                                    onClick={() => setIsPdfSettingsOpen(false)}
+                                />
+                                <div
+                                    className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] max-w-xs sm:absolute sm:top-full sm:right-0 sm:left-auto sm:translate-x-0 sm:translate-y-1 sm:w-36 p-1 rounded-lg shadow-2xl border border-[var(--border-subtle)] overflow-hidden z-50 flex flex-col"
+                                    style={{ background: 'var(--bg-secondary)' }}
+                                >
+                                    <button
+                                        onClick={async () => {
+                                            setIsPdfSettingsOpen(false);
+                                            let finalContent = showTranscript ? transcription : editedNotes;
+                                            if (!title && !showTranscript) finalContent = stripLeadingTitle(finalContent);
+                                            const url = await generatePdf({
+                                                title: derivedTitle,
+                                                date: new Date().toLocaleDateString(locale === 'es' ? 'es-CL' : 'en-US'),
+                                                duration: '',
+                                                content: finalContent,
+                                                style: pdfStyle,
+                                                locale: locale,
+                                                isPlainText: showTranscript,
+                                            }, 'blob');
+                                            if (url && typeof url === 'string') window.open(url, '_blank');
+                                        }}
+                                        className="text-left px-3 py-3 sm:py-2 text-sm sm:text-xs font-medium rounded-md transition-colors hover:bg-[var(--bg-tertiary)]"
+                                        style={{ color: 'var(--text-primary)' }}
+                                    >
+                                        Re-compile
+                                    </button>
+                                </div>
+                            </>
+                        )}
+                    </div>
 
                     <button
                         onClick={handleDownload}

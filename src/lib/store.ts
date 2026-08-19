@@ -73,6 +73,12 @@ interface AppState {
     configOpen: boolean;
     setConfigOpen: (open: boolean) => void;
 
+    // Historial de apuntes guardados
+    historyOpen: boolean;
+    setHistoryOpen: (open: boolean) => void;
+    /** Carga un proyecto guardado en el editor. `false` si ya no existe. */
+    openFromHistory: (projectId: number) => Promise<boolean>;
+
     // Error
     error: string | null;
     setError: (err: string | null) => void;
@@ -163,7 +169,7 @@ function getInitialTranscriptionModel(): string {
 }
 
 // Import DB dynamically to avoid SSR issues if store is used there (though unlikely in standard React usage)
-import { db, createProject, saveAudioSource, getActiveProject } from './db';
+import { db, createProject, saveAudioSource, getActiveProject, loadProject, touchProject } from './db';
 import { progress } from './progress';
 import { abortRun } from './pipeline-control';
 
@@ -258,6 +264,46 @@ export const useAppStore = create<AppState>()(
 
             configOpen: false,
             setConfigOpen: (configOpen) => set({ configOpen }),
+
+            historyOpen: false,
+            setHistoryOpen: (historyOpen) => set({ historyOpen }),
+
+            /**
+             * Abre unos apuntes guardados.
+             *
+             * Corta lo que hubiera en marcha antes de pisar el estado: abrir
+             * algo del historial en mitad de una transcripción dejaba las dos
+             * cosas vivas, y la que terminara última escribía encima de la otra.
+             */
+            openFromHistory: async (projectId) => {
+                const data = await loadProject(projectId);
+                if (!data) return false;
+
+                abortRun();
+                progress.resetIdle();
+
+                // `restoreSession` recupera el proyecto tocado más recientemente.
+                // Sin esto, al recargar la página volvería el proyecto anterior
+                // mientras la pantalla sigue enseñando los apuntes que se acaban
+                // de abrir: el audio del reproductor no sería el de estos apuntes.
+                await touchProject(projectId).catch(() => { /* informativo */ });
+
+                set({
+                    currentProjectId: projectId,
+                    file: data.file,
+                    transcription: data.transcription,
+                    organizedNotes: data.organizedNotes,
+                    editedNotes: data.organizedNotes,
+                    title: data.project.title,
+                    step: 'editor',
+                    processingState: 'idle',
+                    processingProgress: 0,
+                    compressionInfo: '',
+                    error: null,
+                    historyOpen: false,
+                });
+                return true;
+            },
 
             error: null,
             setError: (error) => set({ error }),
